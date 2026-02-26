@@ -3,7 +3,7 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "signalvault-python"
+name = "signalvault"
 version = "0.1.0"
 description = "SignalVault Python SDK — AI audit logs and guardrails for OpenAI applications"
 readme = "README.md"

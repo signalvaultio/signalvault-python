@@ -1,11 +1,11 @@
-# signalvault-python
+# signalvault
 
 AI audit logs and guardrails for your OpenAI Python applications.
 
 ## Installation
 
 ```bash
-pip install signalvault-python openai
+pip install signalvault openai
 ```
 
 ## Quick Start

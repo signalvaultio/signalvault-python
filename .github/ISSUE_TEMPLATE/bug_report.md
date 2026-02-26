@@ -5,7 +5,7 @@ labels: bug
 ---
 
 **SDK version**
-<!-- e.g. 0.1.0 — run: pip show signalvault-python -->
+<!-- e.g. 0.1.0 — run: pip show signalvault -->
 
 **Python version**
 <!-- e.g. 3.11 -->
