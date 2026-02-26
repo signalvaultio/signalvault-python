@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "signalvault-python"
+version = "0.1.0"
+description = "SignalVault Python SDK — AI audit logs and guardrails for OpenAI applications"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+keywords = ["ai", "audit", "guardrails", "openai", "llm", "compliance", "security"]
+authors = [
+    {name = "SignalVault", email = "support@signalvault.io"}
+]
+dependencies = [
+    "openai>=1.0",
+    "httpx>=0.24",
+]
+
+[project.urls]
+Homepage = "https://signalvault.io"
+Documentation = "https://signalvault.io/docs"
+Repository = "https://github.com/signalvaultio/signalvault-python"
+Issues = "https://github.com/signalvaultio/signalvault-python/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["signalvault*"]
