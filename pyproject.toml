@@ -7,7 +7,7 @@ name = "signalvault"
 version = "0.1.0"
 description = "SignalVault Python SDK — AI audit logs and guardrails for OpenAI applications"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.9"
 keywords = ["ai", "audit", "guardrails", "openai", "llm", "compliance", "security"]
 authors = [
