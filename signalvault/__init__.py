@@ -1,6 +1,16 @@
-"""SignalVault Python SDK — AI audit logs and guardrails for OpenAI applications."""
+"""SignalVault Python SDK — AI audit logs and guardrails for OpenAI and Anthropic applications."""
 
-from .client import SignalVaultClient
+from .client import (
+    AnthropicSignalVaultClient,
+    AsyncAnthropicSignalVaultClient,
+    AsyncSignalVaultClient,
+    SignalVaultClient,
+)
 
-__all__ = ["SignalVaultClient"]
-__version__ = "0.1.0"
+__all__ = [
+    "SignalVaultClient",
+    "AsyncSignalVaultClient",
+    "AnthropicSignalVaultClient",
+    "AsyncAnthropicSignalVaultClient",
+]
+__version__ = "0.2.0"
