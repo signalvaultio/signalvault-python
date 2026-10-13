@@ -371,7 +371,7 @@ class _ClientCommon:
         if decision.decision == "block":
             raise SignalVaultBlockedError(request_id, decision.violations, decision.dashboard_url)
         if decision.decision == "warn" and self._config.debug:
-            warnings.warn(f"[SignalVault] Warnings: {decision.violations}", category=SignalVaultWarning)
+            _emit_warning(f"[SignalVault] Warnings: {decision.violations}", SignalVaultWarning)
 
     def _response_body(
         self, request_id: str, model: str, output: str,
@@ -410,6 +410,19 @@ class _ClientCommon:
         elif self._config.debug:
             status = resp.status_code if resp is not None else "no response"
             _emit_warning(f"[SignalVault] Event not delivered: {status}", SignalVaultWarning)
+
+    def _warn_tool_call_status(self, status_code: int) -> None:
+        """4xx → warns regardless of debug; anything else non-2xx → only when debug=True."""
+        if 200 <= status_code < 300:
+            return
+        if 400 <= status_code < 500:
+            self._warn(
+                f"tool-{status_code}",
+                f"[SignalVault] tool_call rejected with {status_code}. "
+                f"Check your api_key and event payload.",
+            )
+        elif self._config.debug:
+            _emit_warning(f"[SignalVault] tool_call event failed: {status_code}", SignalVaultWarning)
 
     def _prepare_tool_call(self, opts: ToolRecordOptions) -> Optional[dict]:
         """Builds the tool_call body now, so it reflects the arguments at call time.
@@ -609,7 +622,7 @@ class _BaseSyncClient(_ClientCommon):
     def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
         resp = self._post_background(body, retry=retry)
         if resp is not None and resp.status_code != 429:
-            _warn_on_client_error(resp.status_code, self._config.debug)
+            self._warn_tool_call_status(resp.status_code)
 
     def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
         """Builds the event now and sends it in the background. Non-blocking."""
@@ -787,21 +800,6 @@ def _serialize_args(args: tuple, kwargs: dict) -> Any:
     return {"args": list(args), "kwargs": dict(kwargs)}
 
 
-def _warn_on_client_error(status_code: int, debug: bool) -> None:
-    """4xx → unconditional ``warnings.warn``; 5xx → only when debug=True."""
-    if 200 <= status_code < 300:
-        return
-    if 400 <= status_code < 500:
-        warnings.warn(
-            f"[SignalVault] tool_call rejected with {status_code}. "
-            f"Check your api_key and event payload.",
-            category=SignalVaultWarning,
-            stacklevel=3,
-        )
-    elif debug:
-        warnings.warn(f"[SignalVault] tool_call event failed: {status_code}", category=SignalVaultWarning)
-
-
 # ---------------------------------------------------------------------------
 # Base async client — shared HTTP logic for OpenAI and Anthropic async clients
 # ---------------------------------------------------------------------------
@@ -964,7 +962,7 @@ class _BaseAsyncClient(_ClientCommon):
     async def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
         resp = await self._post_background(body, retry=retry)
         if resp is not None and resp.status_code != 429:
-            _warn_on_client_error(resp.status_code, self._config.debug)
+            self._warn_tool_call_status(resp.status_code)
 
     def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
         """Builds the event now and schedules the send on the running loop. Non-blocking."""

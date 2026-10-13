@@ -400,6 +400,42 @@ class TestWarningsRepeat:
         assert record[0].filename == __file__
 
 
+class TestToolCallWarnings:
+    def test_rejected_tool_call_warns_at_the_callers_code(self):
+        server = Server({"agent.tool_call": [{"status": 401}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match="tool_call rejected with 401") as record:
+            client.tools.record(tool_name="t", duration_ms=1)
+        assert record[0].filename == __file__
+
+    def test_rejected_tool_call_warns_once_per_window(self):
+        server = Server({"agent.tool_call": [{"status": 401}, {"status": 401}]})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client.tools.record(tool_name="t", duration_ms=1)
+            client.tools.record(tool_name="t", duration_ms=1)
+        assert len([w for w in caught if issubclass(w.category, SignalVaultWarning)]) == 1
+
+    def test_failed_tool_call_warns_only_in_debug(self):
+        server = Server({"agent.tool_call": [{"status": 503}, {"status": 503}]})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sync_client(server).tools.record(tool_name="t", duration_ms=1)
+        assert caught == []
+        with pytest.warns(SignalVaultWarning) as record:
+            sync_client(server, debug=True).tools.record(tool_name="t", duration_ms=1)
+        assert any("tool_call event failed: 503" in str(w.message) for w in record)
+
+    @pytest.mark.asyncio
+    async def test_async_rejected_tool_call_warns(self):
+        server = Server({"agent.tool_call": [{"status": 403}]})
+        client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+        client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+        with pytest.warns(SignalVaultWarning, match="tool_call rejected with 403"):
+            await client.tools.record(tool_name="t", duration_ms=1)
+
+
 class TestRetryPolicy:
     def test_warns_when_the_retry_is_rate_limited_too(self):
         server = Server({
