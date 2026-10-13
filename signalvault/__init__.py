@@ -10,6 +10,7 @@ from .client import (  # noqa: E402
     SignalVaultBlockedError,
     SignalVaultClient,
     SignalVaultUnavailableError,
+    SignalVaultViolationWarning,
     SignalVaultWarning,
 )
 from .tools import ToolContext, ToolRecordOptions  # noqa: E402
@@ -22,6 +23,7 @@ __all__ = [
     "SignalVaultBlockedError",
     "SignalVaultUnavailableError",
     "SignalVaultWarning",
+    "SignalVaultViolationWarning",
     "ToolContext",
     "ToolRecordOptions",
 ]

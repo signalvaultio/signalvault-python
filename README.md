@@ -270,6 +270,17 @@ except SignalVaultUnavailableError as e:
 
 Both are subclasses of `RuntimeError`.
 
+### Warnings
+
+Everything the SDK warns about is a `SignalVaultWarning`. A guardrail `warn` decision (emitted with `debug=True`) uses the subclass `SignalVaultViolationWarning`, so you can treat policy warnings separately from delivery problems:
+
+```python
+import warnings
+from signalvault import SignalVaultViolationWarning
+
+warnings.simplefilter("error", SignalVaultViolationWarning)
+```
+
 ## Mirror Mode
 
 In mirror mode, requests go directly to the AI provider first and SignalVault audits them asynchronously — no latency added, never blocks:
