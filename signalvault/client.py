@@ -117,6 +117,10 @@ class SignalVaultWarning(UserWarning):
     """Emitted when SignalVault cannot check or record a request."""
 
 
+class SignalVaultViolationWarning(SignalVaultWarning):
+    """Emitted when a guardrail returns a ``warn`` decision (with ``debug=True``)."""
+
+
 class SignalVaultBlockedError(RuntimeError):
     """Raised when a guardrail rule blocks the request.
 
@@ -371,7 +375,7 @@ class _ClientCommon:
         if decision.decision == "block":
             raise SignalVaultBlockedError(request_id, decision.violations, decision.dashboard_url)
         if decision.decision == "warn" and self._config.debug:
-            _emit_warning(f"[SignalVault] Warnings: {decision.violations}", SignalVaultWarning)
+            _emit_warning(f"[SignalVault] Warnings: {decision.violations}", SignalVaultViolationWarning)
 
     def _response_body(
         self, request_id: str, model: str, output: str,

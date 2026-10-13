@@ -9,6 +9,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- `SignalVaultViolationWarning`, a subclass of `SignalVaultWarning`, is used for a `warn` guardrail decision (with `debug=True`). Filter on it to handle policy warnings separately from delivery problems; existing `SignalVaultWarning` filters still match.
+
 ### Fixes
 
 - A `warn` guardrail decision (with `debug=True`), a rejected `tool_call` (4xx) and a failed `tool_call` (with `debug=True`) now emit `SignalVaultWarning` instead of a plain `UserWarning`, so `warnings.simplefilter("error", SignalVaultWarning)` catches them. They are reported at the caller's line like the SDK's other warnings, and the rejected `tool_call` warning repeats at most once a minute per status code.

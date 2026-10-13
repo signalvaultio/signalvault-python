@@ -4,6 +4,7 @@ import pytest
 import warnings
 from unittest.mock import MagicMock, patch, AsyncMock
 from signalvault import (
+    SignalVaultViolationWarning,
     SignalVaultWarning,
     SignalVaultClient,
     AsyncSignalVaultClient,
@@ -345,8 +346,12 @@ class TestMirrorMode:
 # ---------------------------------------------------------------------------
 
 class TestWarnDecision:
+    def test_violation_warning_is_a_signalvault_warning(self):
+        """Existing SignalVaultWarning filters keep matching a warn decision."""
+        assert issubclass(SignalVaultViolationWarning, SignalVaultWarning)
+
     def test_sync_warn_decision_emits_warning_in_debug(self):
-        """decision='warn' with debug=True emits a SignalVaultWarning."""
+        """decision='warn' with debug=True emits a SignalVaultViolationWarning."""
         client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake", debug=True)
         fake_response = MagicMock()
         fake_response.choices = [MagicMock()]
@@ -358,7 +363,7 @@ class TestWarnDecision:
         with patch.object(client, "_send_request", return_value=warn_decision), \
              patch.object(client._openai.chat.completions, "create", return_value=fake_response), \
              patch.object(client, "_fire_response"), \
-             pytest.warns(SignalVaultWarning, match="Warnings"):
+             pytest.warns(SignalVaultViolationWarning, match="Warnings"):
             client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "hi"}],
@@ -387,7 +392,7 @@ class TestWarnDecision:
 
     @pytest.mark.asyncio
     async def test_async_warn_decision_emits_warning_in_debug(self):
-        """Async client: decision='warn' with debug=True emits a SignalVaultWarning."""
+        """Async client: decision='warn' with debug=True emits a SignalVaultViolationWarning."""
         client = AsyncSignalVaultClient(api_key="sk_test", openai_api_key="sk-fake", debug=True)
         fake_response = MagicMock()
         fake_response.choices = [MagicMock()]
@@ -399,7 +404,7 @@ class TestWarnDecision:
         with patch.object(client, "_send_request", new=AsyncMock(return_value=warn_decision)), \
              patch.object(client._openai.chat.completions, "create", new=AsyncMock(return_value=fake_response)), \
              patch.object(client, "_send_response_from_parts", new=AsyncMock()), \
-             pytest.warns(SignalVaultWarning, match="Warnings"):
+             pytest.warns(SignalVaultViolationWarning, match="Warnings"):
             await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "hi"}],
