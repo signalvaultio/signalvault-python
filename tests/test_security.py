@@ -314,6 +314,8 @@ class TestProviderObjectsInMessages:
 
     def test_anthropic_content_blocks_are_scanned(self):
         types = pytest.importorskip("anthropic.types")
+        if not hasattr(types, "ToolUseBlock"):
+            pytest.skip("this anthropic version has no ToolUseBlock")
         blocks = [
             types.TextBlock(type="text", text="Let me check."),
             types.ToolUseBlock(type="tool_use", id="tu_1", name="weather", input={"city": "London"}),
@@ -330,6 +332,90 @@ class TestProviderObjectsInMessages:
             {"type": "text", "text": "Let me check."},
             {"type": "tool_use", "id": "tu_1", "name": "weather", "input": {"city": "London"}},
         ]
+
+
+class TestEncoding:
+    def test_lone_surrogate_is_still_scanned(self):
+        server = Server({"ai.request": [{"status": 200, "json": {"decision": "block", "violations": []}}]})
+        client = sync_client(server)
+        with pytest.raises(SignalVaultBlockedError):
+            client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x\ud800y"}])
+        assert b"x\\ud800y" in server.requests[0].content
+        assert not client._openai.chat.completions.create.called
+
+    def test_body_is_json(self):
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server)
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "å"}])
+        assert server.requests[0].headers["content-type"] == "application/json"
+        assert server.bodies[0]["payload"]["messages"][0]["content"] == "å"
+
+    def test_common_metadata_values(self):
+        import datetime
+        import decimal
+        import enum
+        import uuid
+
+        class Plan(enum.Enum):
+            PRO = "pro"
+
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server)
+        client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata={
+            "id": uuid.UUID(int=1), "at": datetime.datetime(2026, 1, 2, 3, 4, 5),
+            "price": decimal.Decimal("1.50"), "plan": Plan.PRO, "tags": {"a"},
+        })
+        assert server.bodies[0]["metadata"] == {
+            "id": "00000000-0000-0000-0000-000000000001", "at": "2026-01-02T03:04:05",
+            "price": "1.50", "plan": "pro", "tags": ["a"],
+        }
+
+    def test_value_that_cannot_be_converted_falls_back_to_repr(self):
+        import dataclasses
+        import threading
+
+        class Detached:
+            def __repr__(self):
+                raise RuntimeError("instance is not bound to a session")
+
+        @dataclasses.dataclass
+        class Holder:
+            lock: threading.Lock
+
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
+            client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata={
+                "user": Detached(), "holder": Holder(threading.Lock()),
+            })
+        metadata = server.bodies[0]["metadata"]
+        assert metadata["user"] == "<unrepresentable Detached>"
+        assert metadata["holder"].startswith("TestEncoding.")  # repr of the dataclass
+        assert client._openai.chat.completions.create.called
+
+    def test_pydantic_v1_shim(self):
+        """openai/anthropic under pydantic v1 expose model_dump, but reject mode="json"."""
+        from pydantic import BaseModel
+
+        class Message(BaseModel):
+            role: str
+            content: str = ""
+
+            def model_dump(self, **kwargs):
+                if "mode" in kwargs:
+                    raise ValueError("mode is only supported in Pydantic v2")
+                return super().model_dump(**kwargs)
+
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server)
+        client.chat.completions.create(model="m", messages=[Message(role="assistant")])
+        assert server.bodies[0]["payload"]["messages"] == [{"role": "assistant"}]
+
+    def test_mock_objects_do_not_hang(self):
+        from signalvault.client import _encode_body
+
+        assert b"MagicMock" in _encode_body({"message": MagicMock()})
 
 
 class TestUnserializableRequest:

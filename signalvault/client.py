@@ -6,6 +6,9 @@ import asyncio
 import atexit
 import concurrent.futures
 import dataclasses
+import datetime as _datetime
+import decimal
+import enum
 import functools
 import inspect
 import json
@@ -25,6 +28,11 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Generator, Li
 from urllib.parse import urlparse
 
 import httpx
+
+try:
+    from pydantic import BaseModel as _PydanticModel
+except ImportError:  # pragma: no cover - openai and anthropic both depend on pydantic
+    _PydanticModel = None
 
 from . import __version__ as SDK_VERSION
 from .tools import (
@@ -247,39 +255,60 @@ def _anthropic_output_text(response: Any) -> str:
     )
 
 
+def _dump_model(obj: Any) -> Any:
+    """The fields a pydantic model was given (by the provider or the caller), under pydantic v1 or v2."""
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump(mode="json", exclude_unset=True)
+        except Exception:
+            # The openai/anthropic shim for pydantic v1 rejects mode="json".
+            return obj.model_dump(exclude_unset=True)
+    return obj.dict(exclude_unset=True)
+
+
 def _json_default(obj: Any) -> Any:
     """Converts what ``json`` can't: provider SDK objects in ``messages`` and similar.
 
     The usual tool-calling loop appends ``response.choices[0].message`` (a
     pydantic model) or Anthropic content blocks to the conversation. Only the
     fields the provider returned are kept, which matches what the Node SDK
-    sends for the same objects.
+    sends for the same objects. Never raises: anything that can't be
+    converted falls back to its ``repr``, so one odd value can't stop the
+    request from being checked.
     """
-    if hasattr(obj, "model_dump"):
-        try:
-            return obj.model_dump(mode="json", exclude_unset=True)
-        except TypeError:
-            return obj.model_dump()
-    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
-        return dataclasses.asdict(obj)
-    if isinstance(obj, (set, frozenset)):
-        return list(obj)
-    if isinstance(obj, (bytes, bytearray)):
-        return obj.decode("utf-8", "replace")
-    return repr(obj)
+    try:
+        if _PydanticModel is not None and isinstance(obj, _PydanticModel):
+            return _dump_model(obj)
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return dataclasses.asdict(obj)
+        if isinstance(obj, (_datetime.date, _datetime.time)):
+            return obj.isoformat()
+        if isinstance(obj, enum.Enum):
+            return obj.value
+        if isinstance(obj, (uuid.UUID, decimal.Decimal)):
+            return str(obj)
+        if isinstance(obj, (set, frozenset)):
+            return list(obj)
+        if isinstance(obj, (bytes, bytearray)):
+            return obj.decode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        return repr(obj)
+    except Exception:
+        return f"<unrepresentable {type(obj).__name__}>"
 
 
 def _encode_body(body: dict) -> bytes:
     """Serializes an event body like httpx's ``json=``, plus ``_json_default``.
 
-    Raises TypeError, ValueError (a cycle, NaN) or RecursionError.
+    ``ensure_ascii`` keeps a lone surrogate in user text encodable (as
+    ``\\udXXX``, as Node's ``JSON.stringify`` sends it) instead of failing.
+    Raises only for a cycle, NaN or extreme nesting.
     """
     return json.dumps(
-        body, default=_json_default, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
-    ).encode("utf-8")
-
-
-_ENCODE_ERRORS = (TypeError, ValueError, RecursionError)
+        body, default=_json_default, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
 
 
 def _retry_delay(resp: Optional[httpx.Response]) -> Optional[float]:
@@ -388,7 +417,7 @@ class _ClientCommon:
         """The encoded pre-flight body, or the fail-mode Decision when it can't be serialized."""
         try:
             return _encode_body(self._preflight_body(request_id, params, metadata))
-        except _ENCODE_ERRORS as exc:
+        except Exception as exc:
             return self._unavailable(
                 request_id, "unserializable",
                 f"The request could not be serialized for SignalVault ({type(exc).__name__}: {exc})",
@@ -398,7 +427,7 @@ class _ClientCommon:
         """The encoded event, or None (with a warning) when it can't be serialized."""
         try:
             return _encode_body(event)
-        except _ENCODE_ERRORS as exc:
+        except Exception as exc:
             self._warn(
                 f"unserializable:{event.get('type')}",
                 f"[SignalVault] {event.get('type')} event dropped: it could not be serialized "
