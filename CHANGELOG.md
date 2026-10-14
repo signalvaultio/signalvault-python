@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixes
+
+- The minimum `openai` version is now 1.26. Streaming sends `stream_options`, which older versions reject with `TypeError: ... unexpected keyword argument 'stream_options'`, so `stream=True` failed on openai 1.0–1.25.
+
 ---
 
 ## [0.5.1] — 2026-10-14

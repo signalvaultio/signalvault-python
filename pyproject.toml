@@ -14,7 +14,8 @@ authors = [
     {name = "SignalVault", email = "support@signalvault.io"}
 ]
 dependencies = [
-    "openai>=1.0",
+    # 1.26 added stream_options, which the SDK sends on every stream.
+    "openai>=1.26",
     "httpx>=0.24",
 ]
 

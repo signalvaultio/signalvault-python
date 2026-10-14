@@ -1,0 +1,5 @@
+# The lowest versions pyproject.toml allows. CI's min-deps job installs these,
+# so raising a floor in pyproject.toml means raising it here too.
+openai==1.26.0
+httpx==0.24.0
+anthropic==0.20.0
