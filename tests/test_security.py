@@ -819,21 +819,25 @@ class OpenAIStreamServer:
         return openai_sse()
 
 
-def openai_sse() -> httpx.Response:
+def openai_sse_events() -> List[str]:
     def chunk(choices, usage=None):
         body = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": choices}
         if usage:
             body["usage"] = usage
         return f"data: {json.dumps(body)}\n\n"
 
-    events = [
+    return [
         chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]),
         chunk([{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]),
         chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
         chunk([], usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
         "data: [DONE]\n\n",
     ]
-    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content="".join(events).encode())
+
+
+def openai_sse() -> httpx.Response:
+    content = "".join(openai_sse_events()).encode()
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=content)
 
 
 class TestRealOpenAIClient:
@@ -878,3 +882,172 @@ class TestRealOpenAIClient:
         assert provider.bodies[0]["stream_options"] == {"include_usage": True}
         assert text == "Hello"
         assert server.bodies[1]["payload"]["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+
+# ---------------------------------------------------------------------------
+# OpenAI stream lifecycle (real openai.Stream / AsyncStream)
+# ---------------------------------------------------------------------------
+
+class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """An SSE response body that records whether it was closed, and can drop mid-stream."""
+
+    def __init__(self, fail: bool = False):
+        events = openai_sse_events()
+        self.parts = [e.encode() for e in (events[:2] if fail else events)]
+        self.fail = fail
+        self.closed = False
+
+    def __iter__(self):
+        yield from self.parts
+        if self.fail:
+            raise httpx.ReadError("connection lost")
+
+    async def __aiter__(self):
+        for part in self.parts:
+            yield part
+        if self.fail:
+            raise httpx.ReadError("connection lost")
+
+    def close(self):
+        self.closed = True
+
+    async def aclose(self):
+        self.closed = True
+
+
+def provider_handler(body: TrackedBody):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+    return handler
+
+
+def streaming_client(body: TrackedBody, mirror: bool = False):
+    import openai
+
+    server = Server({"ai.request": [ALLOW]})
+    client = sync_client(server, mirror_mode=mirror)
+    client._openai = openai.OpenAI(
+        api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(provider_handler(body))),
+    )
+    return client, server
+
+
+def async_streaming_client(body: TrackedBody):
+    import openai
+
+    server = Server({"ai.request": [ALLOW]})
+    client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+    client._openai = openai.AsyncOpenAI(
+        api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider_handler(body))),
+    )
+    return client, server
+
+
+def responses(server: Server) -> List[dict]:
+    return [b["payload"] for b in server.bodies if b["type"] == "ai.response"]
+
+
+def read_until_hello(stream) -> None:
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content == "Hello":
+            break
+
+
+class TestStreamLifecycle:
+    def test_with_block_closes_and_records_on_break(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        with client.chat.completions.create(model="m", messages=MESSAGES, stream=True) as stream:
+            assert isinstance(stream, signalvault.SignalVaultStream)
+            assert stream.response.status_code == 200
+            read_until_hello(stream)
+            assert not body.closed
+        assert body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+
+    def test_close_records_once(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+        stream.close()
+        stream.close()
+        assert list(stream) == []
+        del stream
+        client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    def test_break_without_close_records_when_collected(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+        del stream
+        client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_exhausted_stream_records_and_closes(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        assert len(list(stream)) == 3
+        assert body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+    def test_error_mid_stream_closes_records_and_raises(self):
+        body = TrackedBody(fail=True)
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(Exception):
+            for _ in stream:
+                pass
+        assert body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_mirror_mode_records_on_with_exit(self):
+        body = TrackedBody()
+        client, server = streaming_client(body, mirror=True)
+        with client.chat.completions.create(model="m", messages=MESSAGES, stream=True) as stream:
+            read_until_hello(stream)
+        client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_with_block_closes_and_records_on_break(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        assert isinstance(stream, signalvault.AsyncSignalVaultStream)
+        async with stream:
+            assert stream.response.status_code == 200
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                    break
+            assert not body.closed
+        assert body.closed
+        await stream.close()
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_error_mid_stream_closes_records_and_raises(self):
+        body = TrackedBody(fail=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(Exception):
+            async for _ in stream:
+                pass
+        assert body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]

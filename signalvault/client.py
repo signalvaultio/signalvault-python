@@ -1230,6 +1230,170 @@ def _with_stream_usage(kwargs: dict, stream: bool) -> bool:
     return True
 
 
+class _ChunkCollector:
+    """Collects the text and token usage of an OpenAI stream."""
+
+    def __init__(self, hide_usage_chunk: bool):
+        self.parts: List[str] = []
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self._hide_usage_chunk = hide_usage_chunk
+
+    def add(self, chunk: Any) -> bool:
+        """Records a chunk. Returns False for the usage-only chunk the caller didn't ask for."""
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            self.parts.append(delta.content)
+        if getattr(chunk, "usage", None):
+            self.prompt_tokens = chunk.usage.prompt_tokens or 0
+            self.completion_tokens = chunk.usage.completion_tokens or 0
+            if self._hide_usage_chunk and not chunk.choices:
+                return False
+        return True
+
+
+class SignalVaultStream:
+    """Returned by ``chat.completions.create(..., stream=True)`` on the sync OpenAI client.
+
+    Iterates the provider's stream and records the response once: when the
+    stream ends, raises, or is closed. A ``for`` loop doesn't close its
+    iterator on ``break``, so use ``with`` (or call ``close()``) when you may
+    stop early. Otherwise the response is recorded when the stream is
+    garbage-collected.
+    """
+
+    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+        self._upstream = upstream
+        self._iterator = iter(upstream)
+        self._collector = collector
+        self._record = record
+        self._closed = False
+
+    @property
+    def response(self) -> Any:
+        """The provider's HTTP response (``openai.Stream.response``)."""
+        return self._upstream.response
+
+    def __iter__(self) -> "SignalVaultStream":
+        return self
+
+    def __next__(self) -> Any:
+        if self._closed:
+            raise StopIteration
+        try:
+            while True:
+                chunk = next(self._iterator)
+                if self._collector.add(chunk):
+                    return chunk
+        except BaseException:
+            try:
+                self.close()
+            except Exception:
+                pass  # keep the original exception, or the normal end of the stream
+            raise
+
+    def close(self) -> None:
+        """Closes the provider stream and records the response. Safe to call twice."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._upstream, "close", None)
+            if callable(close):
+                close()
+        finally:
+            c = self._collector
+            self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+
+    def __enter__(self) -> "SignalVaultStream":
+        return self
+
+    def __exit__(self, *exc_info: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        if getattr(self, "_closed", True):
+            return
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+class AsyncSignalVaultStream:
+    """Returned by ``chat.completions.create(..., stream=True)`` on the async OpenAI client.
+
+    The async counterpart of :class:`SignalVaultStream`. Use ``async with``
+    (or ``await stream.close()``) when you may stop early.
+    """
+
+    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+        self._upstream = upstream
+        self._iterator = upstream.__aiter__()
+        self._collector = collector
+        self._record = record
+        self._closed = False
+
+    @property
+    def response(self) -> Any:
+        """The provider's HTTP response (``openai.AsyncStream.response``)."""
+        return self._upstream.response
+
+    def __aiter__(self) -> "AsyncSignalVaultStream":
+        return self
+
+    async def __anext__(self) -> Any:
+        if self._closed:
+            raise StopAsyncIteration
+        try:
+            while True:
+                chunk = await self._iterator.__anext__()
+                if self._collector.add(chunk):
+                    return chunk
+        except BaseException:
+            try:
+                await self.close()
+            except Exception:
+                pass  # keep the original exception, or the normal end of the stream
+            raise
+
+    async def close(self) -> None:
+        """Closes the provider stream and records the response. Safe to call twice."""
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            close = getattr(self._upstream, "close", None)
+            if close is None:
+                close = getattr(self._upstream, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        c = self._collector
+        self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+
+    async def __aenter__(self) -> "AsyncSignalVaultStream":
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        await self.close()
+
+    def __del__(self) -> None:
+        # Can't await the provider's close() here; the response is still recorded.
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        try:
+            self._finish()
+        except Exception:
+            pass
+
+
 class _ChatCompletions:
     """Proxies `client.chat.completions.create(...)` with SignalVault guardrails."""
 
@@ -1295,26 +1459,10 @@ class _ChatCompletions:
     def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None, hide_usage_chunk: bool = False,
-    ) -> Generator[Any, None, None]:
-        chunks: List[str] = []
-        prompt_tokens = 0
-        completion_tokens = 0
+    ) -> SignalVaultStream:
+        model = kwargs.get("model", "")
 
-        try:
-            for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    chunks.append(delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
-                    # The usage-only final chunk the caller didn't ask for.
-                    if hide_usage_chunk and not chunk.choices:
-                        continue
-                yield chunk
-        finally:
-            output = "".join(chunks)
-            model = kwargs.get("model", "")
+        def record(output: str, prompt_tokens: int, completion_tokens: int) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
@@ -1324,6 +1472,8 @@ class _ChatCompletions:
                 self._sv._fire_response(
                     request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
                 )
+
+        return SignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)
 
 
 class _Chat:
@@ -1460,30 +1610,14 @@ class _AsyncChatCompletions:
         )
         return response
 
-    async def _wrap_stream(
+    def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None, hide_usage_chunk: bool = False,
-    ) -> AsyncGenerator[Any, None]:
-        chunks: List[str] = []
-        prompt_tokens = 0
-        completion_tokens = 0
+    ) -> AsyncSignalVaultStream:
+        model = kwargs.get("model", "")
 
-        try:
-            async for chunk in stream:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta and delta.content:
-                    chunks.append(delta.content)
-                if hasattr(chunk, "usage") and chunk.usage:
-                    prompt_tokens = chunk.usage.prompt_tokens or 0
-                    completion_tokens = chunk.usage.completion_tokens or 0
-                    # The usage-only final chunk the caller didn't ask for.
-                    if hide_usage_chunk and not chunk.choices:
-                        continue
-                yield chunk
-        finally:
-            output = "".join(chunks)
-            model = kwargs.get("model", "")
-            coro = (
+        def record(output: str, prompt_tokens: int, completion_tokens: int) -> None:
+            self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, prompt_tokens, completion_tokens, metadata,
@@ -1493,7 +1627,8 @@ class _AsyncChatCompletions:
                     request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
                 )
             )
-            self._sv._spawn(coro)
+
+        return AsyncSignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)
 
 
 class _AsyncChat:
