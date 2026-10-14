@@ -5,8 +5,13 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import dataclasses
+import datetime as _datetime
+import decimal
+import enum
 import functools
 import inspect
+import json
 import os
 import platform
 import random
@@ -23,6 +28,11 @@ from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Generator, Li
 from urllib.parse import urlparse
 
 import httpx
+
+try:
+    from pydantic import BaseModel as _PydanticModel
+except ImportError:  # pragma: no cover - openai and anthropic both depend on pydantic
+    _PydanticModel = None
 
 from . import __version__ as SDK_VERSION
 from .tools import (
@@ -245,6 +255,62 @@ def _anthropic_output_text(response: Any) -> str:
     )
 
 
+def _dump_model(obj: Any) -> Any:
+    """The fields a pydantic model was given (by the provider or the caller), under pydantic v1 or v2."""
+    if hasattr(obj, "model_dump"):
+        try:
+            return obj.model_dump(mode="json", exclude_unset=True)
+        except Exception:
+            # The openai/anthropic shim for pydantic v1 rejects mode="json".
+            return obj.model_dump(exclude_unset=True)
+    return obj.dict(exclude_unset=True)
+
+
+def _json_default(obj: Any) -> Any:
+    """Converts what ``json`` can't: provider SDK objects in ``messages`` and similar.
+
+    The usual tool-calling loop appends ``response.choices[0].message`` (a
+    pydantic model) or Anthropic content blocks to the conversation. Only the
+    fields the provider returned are kept, which matches what the Node SDK
+    sends for the same objects. Never raises: anything that can't be
+    converted falls back to its ``repr``, so one odd value can't stop the
+    request from being checked.
+    """
+    try:
+        if _PydanticModel is not None and isinstance(obj, _PydanticModel):
+            return _dump_model(obj)
+        if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+            return dataclasses.asdict(obj)
+        if isinstance(obj, (_datetime.date, _datetime.time)):
+            return obj.isoformat()
+        if isinstance(obj, enum.Enum):
+            return obj.value
+        if isinstance(obj, (uuid.UUID, decimal.Decimal)):
+            return str(obj)
+        if isinstance(obj, (set, frozenset)):
+            return list(obj)
+        if isinstance(obj, (bytes, bytearray)):
+            return obj.decode("utf-8", "replace")
+    except Exception:
+        pass
+    try:
+        return repr(obj)
+    except Exception:
+        return f"<unrepresentable {type(obj).__name__}>"
+
+
+def _encode_body(body: dict) -> bytes:
+    """Serializes an event body like httpx's ``json=``, plus ``_json_default``.
+
+    ``ensure_ascii`` keeps a lone surrogate in user text encodable (as
+    ``\\udXXX``, as Node's ``JSON.stringify`` sends it) instead of failing.
+    Raises only for a cycle, NaN or extreme nesting.
+    """
+    return json.dumps(
+        body, default=_json_default, separators=(",", ":"), allow_nan=False,
+    ).encode("ascii")
+
+
 def _retry_delay(resp: Optional[httpx.Response]) -> Optional[float]:
     """Seconds to wait before retrying a failed response once, or None for no retry."""
     if resp is None:
@@ -346,6 +412,28 @@ class _ClientCommon:
         body = self._preflight_body(request_id, params, metadata)
         body["payload"]["preflight_unavailable"] = True
         return body
+
+    def _encode_preflight(self, request_id: str, params: dict, metadata: dict) -> Any:
+        """The encoded pre-flight body, or the fail-mode Decision when it can't be serialized."""
+        try:
+            return _encode_body(self._preflight_body(request_id, params, metadata))
+        except Exception as exc:
+            return self._unavailable(
+                request_id, "unserializable",
+                f"The request could not be serialized for SignalVault ({type(exc).__name__}: {exc})",
+            )
+
+    def _encode_event(self, event: dict) -> Optional[bytes]:
+        """The encoded event, or None (with a warning) when it can't be serialized."""
+        try:
+            return _encode_body(event)
+        except Exception as exc:
+            self._warn(
+                f"unserializable:{event.get('type')}",
+                f"[SignalVault] {event.get('type')} event dropped: it could not be serialized "
+                f"({type(exc).__name__}: {exc}).",
+            )
+            return None
 
     def _preflight_body(self, request_id: str, params: dict, metadata: dict) -> dict:
         return {
@@ -498,12 +586,12 @@ class _BaseSyncClient(_ClientCommon):
 
     # -- Internal HTTP -------------------------------------------------------
 
-    def _post(self, body: dict, timeout: float) -> httpx.Response:
+    def _post(self, content: bytes, timeout: float) -> httpx.Response:
         return self._http.post(
             f"{self._config.base_url}/v1/events",
             headers=self._headers(),
             timeout=timeout,
-            json=body,
+            content=content,
         )
 
     def _post_background(
@@ -519,10 +607,13 @@ class _BaseSyncClient(_ClientCommon):
         twice as long. Returns the last response, or None.
         """
         event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
+        content = self._encode_event(event)
+        if content is None:
+            return None
         resp: Optional[httpx.Response] = None
         delay: Optional[float] = None
         try:
-            resp = self._post(event, self._config.timeout)
+            resp = self._post(content, self._config.timeout)
             if 200 <= resp.status_code < 300:
                 return resp
             delay = _retry_delay(resp)
@@ -537,7 +628,7 @@ class _BaseSyncClient(_ClientCommon):
         if retry and delay is not None:
             time.sleep(delay)
             try:
-                resp = self._post(event, self._config.timeout)
+                resp = self._post(content, self._config.timeout)
                 if 200 <= resp.status_code < 300:
                     return resp
             except httpx.HTTPError:
@@ -548,10 +639,11 @@ class _BaseSyncClient(_ClientCommon):
         return resp
 
     def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
+        content = self._encode_preflight(request_id, params, metadata)
+        if isinstance(content, Decision):
+            return content
         try:
-            resp = self._post(
-                self._preflight_body(request_id, params, metadata), self._config.preflight_timeout,
-            )
+            resp = self._post(content, self._config.preflight_timeout)
         except httpx.TimeoutException:
             return self._unavailable(
                 request_id, "timeout",
@@ -864,12 +956,12 @@ class _BaseAsyncClient(_ClientCommon):
 
     # -- Internal HTTP -------------------------------------------------------
 
-    async def _post(self, body: dict, timeout: float) -> httpx.Response:
+    async def _post(self, content: bytes, timeout: float) -> httpx.Response:
         return await self._http.post(
             f"{self._config.base_url}/v1/events",
             headers=self._headers(),
             timeout=timeout,
-            json=body,
+            content=content,
         )
 
     async def _post_background(
@@ -885,10 +977,13 @@ class _BaseAsyncClient(_ClientCommon):
         twice as long. Returns the last response, or None.
         """
         event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
+        content = self._encode_event(event)
+        if content is None:
+            return None
         resp: Optional[httpx.Response] = None
         delay: Optional[float] = None
         try:
-            resp = await self._post(event, self._config.timeout)
+            resp = await self._post(content, self._config.timeout)
             if 200 <= resp.status_code < 300:
                 return resp
             delay = _retry_delay(resp)
@@ -903,7 +998,7 @@ class _BaseAsyncClient(_ClientCommon):
         if retry and delay is not None:
             await asyncio.sleep(delay)
             try:
-                resp = await self._post(event, self._config.timeout)
+                resp = await self._post(content, self._config.timeout)
                 if 200 <= resp.status_code < 300:
                     return resp
             except httpx.HTTPError:
@@ -914,10 +1009,11 @@ class _BaseAsyncClient(_ClientCommon):
         return resp
 
     async def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
+        content = self._encode_preflight(request_id, params, metadata)
+        if isinstance(content, Decision):
+            return content
         try:
-            resp = await self._post(
-                self._preflight_body(request_id, params, metadata), self._config.preflight_timeout,
-            )
+            resp = await self._post(content, self._config.preflight_timeout)
         except httpx.TimeoutException:
             return self._unavailable(
                 request_id, "timeout",

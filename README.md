@@ -221,7 +221,7 @@ response = client.chat.completions.create(
 
 ## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, or an invalid response — `fail_mode` decides what happens:
+The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, an invalid response, or a request that can't be serialized (for example a circular reference in `sv_metadata`) — `fail_mode` decides what happens:
 
 - `"open"` (default): the request goes to the provider **without** guardrails, and the SDK emits a `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
 - `"closed"`: the SDK raises `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
