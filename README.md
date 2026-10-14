@@ -87,7 +87,8 @@ stream = client.chat.completions.create(
     stream=True,
 )
 for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # OpenAI streaming (async)
 stream = await async_client.chat.completions.create(
@@ -96,7 +97,8 @@ stream = await async_client.chat.completions.create(
     stream=True,
 )
 async for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # Anthropic streaming
 stream = anthropic_client.messages.create(
@@ -109,6 +111,8 @@ for event in stream:
     if event.type == "content_block_delta":
         print(event.delta.text or "", end="", flush=True)
 ```
+
+For OpenAI streams, the SDK sets `stream_options={"include_usage": True}` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and no choices; the SDK consumes that chunk rather than passing it to you. If you set `include_usage` yourself, your setting is kept: with `True` you receive the usage chunk, whose `choices` list is empty (hence the `if chunk.choices:` guard above), and with `False` the response is logged without token counts. Other stream options you pass are kept. If your OpenAI-compatible server (set through `OPENAI_BASE_URL`) rejects `stream_options`, pass `stream_options=None` and the SDK sends none; responses are then logged without token counts.
 
 ## Agent Tool-Use Capture
 
