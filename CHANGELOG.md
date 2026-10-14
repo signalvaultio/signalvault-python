@@ -7,9 +7,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum `openai` version is now 1.26. Streaming sends `stream_options`, which older versions reject with `TypeError: ... unexpected keyword argument 'stream_options'`, so `stream=True` failed on openai 1.0–1.25. If you pin `openai` below 1.26, upgrade it together with this release. (#23)
+
 ### Fixes
 
-- The minimum `openai` version is now 1.26. Streaming sends `stream_options`, which older versions reject with `TypeError: ... unexpected keyword argument 'stream_options'`, so `stream=True` failed on openai 1.0–1.25.
+- Provider SDK objects in `messages` no longer raise `TypeError`. The usual tool-calling loop appends `response.choices[0].message` (or Anthropic content blocks) to the conversation; these are now sent with the fields the provider returned, as the Node SDK does, under pydantic v1 and v2. Previously the pre-flight check raised even with `fail_mode="open"`, and in mirror mode the audit event was dropped silently. (#22)
+- Other values in `messages` and `sv_metadata` that JSON can't represent are converted instead of failing: dates and times as ISO 8601, `UUID` and `Decimal` as strings, enums as their value, sets as lists, and anything else as its `repr`. (#22)
+- A request that still can't be serialized (a circular reference or NaN in `sv_metadata`) follows `fail_mode`: with `"open"` it emits a `SignalVaultWarning` and the request goes ahead, with `"closed"` it raises `SignalVaultUnavailableError`. A background event that can't be serialized is dropped with a `SignalVaultWarning` (at most once a minute per event type), not silently. (#22)
 
 ---
 
