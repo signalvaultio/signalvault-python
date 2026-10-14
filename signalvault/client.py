@@ -191,6 +191,26 @@ def normalize_base_url(raw: str) -> str:
     return raw.rstrip("/")
 
 
+def _normalize_api_key(raw: Any) -> str:
+    """Strips surrounding whitespace and refuses keys that can't go in a header.
+
+    A key read from a file or a secret often ends in a newline. Sent as is,
+    every request fails before it leaves the process, so with fail_mode="open"
+    every call would go through unchecked. Errors never include the key.
+    """
+    if not isinstance(raw, str):
+        raise TypeError(f"[SignalVault] api_key must be a string, got {type(raw).__name__}")
+    key = raw.strip()
+    if not key:
+        raise ValueError("[SignalVault] api_key is empty")
+    if any(not "\x21" <= ch <= "\x7e" for ch in key):
+        raise ValueError(
+            "[SignalVault] api_key contains whitespace, control or non-ASCII characters. "
+            "Check how the key is loaded."
+        )
+    return key
+
+
 def _build_config(
     api_key: str, base_url: str, environment: str, debug: bool, mirror_mode: bool,
     fail_mode: str, preflight_timeout: float, timeout: float,
@@ -199,7 +219,7 @@ def _build_config(
     if fail_mode not in _FAIL_MODES:
         raise ValueError("[SignalVault] fail_mode must be 'open' or 'closed'")
     return SignalVaultConfig(
-        api_key=api_key,
+        api_key=_normalize_api_key(api_key),
         base_url=normalize_base_url(base_url),
         environment=environment,
         debug=debug,

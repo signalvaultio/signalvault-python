@@ -7,6 +7,10 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Security
+
+- An `api_key` with surrounding whitespace, such as the trailing newline a key read from a file or a Kubernetes secret usually has, made every request to SignalVault fail before it was sent. With the default `fail_mode="open"`, every call then went to the provider without a guardrail check or an audit event, and the warning said the API was unreachable. With `debug=True` the traceback also showed the key. Surrounding whitespace is now stripped, and a key that is empty or contains other whitespace, control or non-ASCII characters raises `ValueError` when the client is created (`TypeError` if it isn't a string). The error never includes the key. (GHSA-m2xh-jwwm-2g56)
+
 ### Changed
 
 - The minimum `openai` version is now 1.26. Streaming sends `stream_options`, which older versions reject with `TypeError: ... unexpected keyword argument 'stream_options'`, so `stream=True` failed on openai 1.0–1.25. If you pin `openai` below 1.26, upgrade it together with this release. (#23)
