@@ -1093,16 +1093,24 @@ class _AsyncToolsAPI:
 # ---------------------------------------------------------------------------
 
 def _with_stream_usage(kwargs: dict, stream: bool) -> bool:
-    """Asks OpenAI to report token usage on a stream, unless the caller set ``stream_options``.
+    """Asks OpenAI to report token usage on a stream, unless the caller already decided.
 
     OpenAI then sends one extra final chunk with an empty ``choices`` list.
-    Returns True when the option was added here, so the stream wrapper
+    Returns True when ``include_usage`` was added here, so the stream wrapper
     consumes that chunk instead of passing it to a caller who never asked
-    for it. Matches the Node SDK.
+    for it. Other stream options the caller set are kept. ``stream_options=None``
+    sends no stream options at all, for OpenAI-compatible servers that reject
+    them. Matches ``withStreamUsage`` in the Node SDK.
     """
-    if not stream or "stream_options" in kwargs:
+    if not stream:
         return False
-    kwargs["stream_options"] = {"include_usage": True}
+    options = kwargs.get("stream_options", {})
+    if options is None:
+        del kwargs["stream_options"]
+        return False
+    if not isinstance(options, dict) or options.get("include_usage") is not None:
+        return False
+    kwargs["stream_options"] = {**options, "include_usage": True}
     return True
 
 

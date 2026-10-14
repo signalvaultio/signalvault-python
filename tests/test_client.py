@@ -1,5 +1,6 @@
 """Unit tests for SignalVault Python SDK (no network calls)."""
 
+import copy
 import pytest
 import warnings
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -11,7 +12,7 @@ from signalvault import (
     AnthropicSignalVaultClient,
     AsyncAnthropicSignalVaultClient,
 )
-from signalvault.client import Decision, _merge_metadata, _parse_decision, Violation
+from signalvault.client import Decision, _merge_metadata, _parse_decision, _with_stream_usage, Violation
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +295,9 @@ class TestStreaming:
         assert args[2] == "Hello"  # only the first chunk was accumulated
 
 
+_ABSENT = object()
+
+
 class TestStreamUsageChunk:
     """The usage-only final chunk is consumed only when the SDK asked for it."""
 
@@ -317,61 +321,112 @@ class TestStreamUsageChunk:
             chunk([], usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}),
         ]
 
-    def _stream(self, client, chunks, **kwargs):
+    def _stream(self, chunks, mirror=False, **kwargs):
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake", mirror_mode=mirror)
+        recorder = "_fire_audit" if mirror else "_fire_response"
         with patch.object(client, "_send_request", return_value=Decision()), \
              patch.object(client._openai.chat.completions, "create", return_value=iter(chunks)) as create, \
-             patch.object(client, "_fire_response") as fire:
+             patch.object(client, recorder) as record:
             yielded = list(client.chat.completions.create(
                 model="m", messages=[{"role": "user", "content": "hi"}], stream=True, **kwargs,
             ))
-        return yielded, create.call_args.kwargs, fire.call_args[0]
+        return yielded, create.call_args.kwargs, self._recorded(record, mirror)
 
-    def test_injected_usage_chunk_is_consumed(self):
-        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
-        yielded, sent, fired = self._stream(client, self._chunks())
-        assert sent["stream_options"] == {"include_usage": True}
-        assert len(yielded) == 4
-        # The README loop, unguarded, works on every chunk the caller receives.
-        assert "".join(c.choices[0].delta.content or "" for c in yielded) == "Hello world"
-        assert fired[2:5] == ("Hello world", 10, 5)
-
-    def test_caller_requested_usage_chunk_is_passed_through(self):
-        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
-        yielded, sent, fired = self._stream(
-            client, self._chunks(), stream_options={"include_usage": True},
-        )
-        assert len(yielded) == 5
-        assert yielded[-1].choices == [] and yielded[-1].usage.prompt_tokens == 10
-        assert fired[2:5] == ("Hello world", 10, 5)
-
-    def test_usage_on_a_content_chunk_is_recorded(self):
-        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
-        from openai.types import CompletionUsage
-
-        chunks = self._chunks()[:3]
-        chunks[-1].usage = CompletionUsage(prompt_tokens=7, completion_tokens=2, total_tokens=9)
-        yielded, _, fired = self._stream(client, chunks)
-        assert len(yielded) == 3
-        assert fired[2:5] == ("Hello world", 7, 2)
-
-    async def test_async_injected_usage_chunk_is_consumed(self):
-        client = AsyncSignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
-        chunks = self._chunks()
+    async def _astream(self, chunks, mirror=False, **kwargs):
+        client = AsyncSignalVaultClient(api_key="sk_test", openai_api_key="sk-fake", mirror_mode=mirror)
+        recorder = "_send_audit_from_parts" if mirror else "_send_response_from_parts"
 
         async def stream():
             for c in chunks:
                 yield c
 
         with patch.object(client, "_send_request", new=AsyncMock(return_value=Decision())), \
-             patch.object(client._openai.chat.completions, "create", new=AsyncMock(return_value=stream())), \
-             patch.object(client, "_send_response_from_parts", new=AsyncMock()) as send:
+             patch.object(client._openai.chat.completions, "create", new=AsyncMock(return_value=stream())) as create, \
+             patch.object(client, recorder, new=AsyncMock()) as record:
             gen = await client.chat.completions.create(
-                model="m", messages=[{"role": "user", "content": "hi"}], stream=True,
+                model="m", messages=[{"role": "user", "content": "hi"}], stream=True, **kwargs,
             )
             yielded = [c async for c in gen]
             await client.flush()
+        return yielded, create.call_args.kwargs, self._recorded(record, mirror)
+
+    @staticmethod
+    def _recorded(record, mirror):
+        """(output, prompt_tokens, completion_tokens); audit events also carry the messages."""
+        args = record.call_args[0]
+        return args[3:6] if mirror else args[2:5]
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_injected_usage_chunk_is_consumed(self, mirror):
+        yielded, sent, recorded = self._stream(self._chunks(), mirror=mirror)
+        assert sent["stream_options"] == {"include_usage": True}
         assert len(yielded) == 4
-        assert send.call_args[0][2:5] == ("Hello world", 10, 5)
+        # The README loop, unguarded, works on every chunk the caller receives.
+        assert "".join(c.choices[0].delta.content or "" for c in yielded) == "Hello world"
+        assert recorded == ("Hello world", 10, 5)
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    async def test_async_injected_usage_chunk_is_consumed(self, mirror):
+        yielded, sent, recorded = await self._astream(self._chunks(), mirror=mirror)
+        assert sent["stream_options"] == {"include_usage": True}
+        assert len(yielded) == 4
+        assert recorded == ("Hello world", 10, 5)
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_caller_requested_usage_chunk_is_passed_through(self, mirror):
+        yielded, _, recorded = self._stream(
+            self._chunks(), mirror=mirror, stream_options={"include_usage": True},
+        )
+        assert len(yielded) == 5
+        assert yielded[-1].choices == [] and yielded[-1].usage.prompt_tokens == 10
+        assert recorded == ("Hello world", 10, 5)
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    async def test_async_caller_requested_usage_chunk_is_passed_through(self, mirror):
+        yielded, _, recorded = await self._astream(
+            self._chunks(), mirror=mirror, stream_options={"include_usage": True},
+        )
+        assert len(yielded) == 5
+        assert yielded[-1].choices == []
+        assert recorded == ("Hello world", 10, 5)
+
+    def test_other_stream_options_still_get_usage(self):
+        yielded, sent, recorded = self._stream(
+            self._chunks(), stream_options={"include_obfuscation": False},
+        )
+        assert sent["stream_options"] == {"include_obfuscation": False, "include_usage": True}
+        assert len(yielded) == 4
+        assert recorded == ("Hello world", 10, 5)
+
+    def test_usage_on_a_content_chunk_is_recorded(self):
+        from openai.types import CompletionUsage
+
+        chunks = self._chunks()[:3]
+        chunks[-1].usage = CompletionUsage(prompt_tokens=7, completion_tokens=2, total_tokens=9)
+        yielded, _, recorded = self._stream(chunks)
+        assert len(yielded) == 3
+        assert recorded == ("Hello world", 7, 2)
+
+    @pytest.mark.parametrize("given, sent, injected", [
+        (_ABSENT, {"include_usage": True}, True),
+        ({}, {"include_usage": True}, True),
+        ({"include_obfuscation": False}, {"include_obfuscation": False, "include_usage": True}, True),
+        ({"include_usage": None}, {"include_usage": True}, True),
+        ({"include_usage": True}, {"include_usage": True}, False),
+        ({"include_usage": False}, {"include_usage": False}, False),
+        (None, _ABSENT, False),
+    ])
+    def test_with_stream_usage(self, given, sent, injected):
+        kwargs = {} if given is _ABSENT else {"stream_options": given}
+        before = copy.deepcopy(given) if isinstance(given, dict) else given
+        assert _with_stream_usage(kwargs, stream=True) is injected
+        assert kwargs.get("stream_options", _ABSENT) == sent
+        assert given == before  # the caller's dict is not mutated
+
+    def test_with_stream_usage_leaves_non_streaming_calls_alone(self):
+        kwargs = {"stream_options": None}
+        assert _with_stream_usage(kwargs, stream=False) is False
+        assert kwargs == {"stream_options": None}
 
 
 # ---------------------------------------------------------------------------

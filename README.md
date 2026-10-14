@@ -112,7 +112,7 @@ for event in stream:
         print(event.delta.text or "", end="", flush=True)
 ```
 
-For OpenAI streams the SDK sets `stream_options={"include_usage": True}` so it can record token counts, and consumes the extra usage-only final chunk itself. If you pass `stream_options` yourself, it is left as you set it and that chunk (with an empty `choices` list) reaches your loop. The `if chunk.choices:` guard handles that case and OpenAI-compatible providers that send chunks without choices.
+For OpenAI streams, the SDK sets `stream_options={"include_usage": True}` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and no choices; the SDK consumes that chunk rather than passing it to you. If you set `include_usage` yourself, your setting is kept: with `True` you receive the usage chunk, whose `choices` list is empty (hence the `if chunk.choices:` guard above), and with `False` the response is logged without token counts. Other stream options you pass are kept. If your OpenAI-compatible server (set through `OPENAI_BASE_URL`) rejects `stream_options`, pass `stream_options=None` and the SDK sends none; responses are then logged without token counts.
 
 ## Agent Tool-Use Capture
 
