@@ -743,3 +743,80 @@ class TestFailureClassification:
         for bad in ("https://api.signalvault.io?x=1", "https://api.signalvault.io#frag"):
             with pytest.raises(ValueError, match="query or fragment"):
                 normalize_base_url(bad)
+
+
+# ---------------------------------------------------------------------------
+# Real provider clients (only the HTTP layer is mocked)
+# ---------------------------------------------------------------------------
+
+
+class OpenAIStreamServer:
+    """Answers like OpenAI's streaming API, including the usage-only final chunk."""
+
+    def __init__(self):
+        self.bodies: List[dict] = []
+
+    def handler(self, request: httpx.Request) -> httpx.Response:
+        self.bodies.append(json.loads(request.content))
+        return openai_sse()
+
+
+def openai_sse() -> httpx.Response:
+    def chunk(choices, usage=None):
+        body = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": choices}
+        if usage:
+            body["usage"] = usage
+        return f"data: {json.dumps(body)}\n\n"
+
+    events = [
+        chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]),
+        chunk([{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]),
+        chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
+        chunk([], usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
+        "data: [DONE]\n\n",
+    ]
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content="".join(events).encode())
+
+
+class TestRealOpenAIClient:
+    """Runs against the installed openai package, so CI on the minimum versions catches API drift."""
+
+    def test_stream(self):
+        import openai
+
+        server = Server({"ai.request": [ALLOW]})
+        provider = OpenAIStreamServer()
+        client = sync_client(server)
+        client._openai = openai.OpenAI(
+            api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+            http_client=httpx.Client(transport=httpx.MockTransport(provider.handler)),
+        )
+        text = "".join(
+            c.choices[0].delta.content or ""
+            for c in client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        )
+        client.flush()
+        assert provider.bodies[0]["stream_options"] == {"include_usage": True}
+        assert text == "Hello"
+        response = server.bodies[1]["payload"]
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+    @pytest.mark.asyncio
+    async def test_async_stream(self):
+        import openai
+
+        server = Server({"ai.request": [ALLOW]})
+        client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+        client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+        provider = OpenAIStreamServer()
+        client._openai = openai.AsyncOpenAI(
+            api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider.handler)),
+        )
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        text = "".join([c.choices[0].delta.content or "" async for c in stream])
+        await client.flush()
+        assert provider.bodies[0]["stream_options"] == {"include_usage": True}
+        assert text == "Hello"
+        assert server.bodies[1]["payload"]["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
