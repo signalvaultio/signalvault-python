@@ -1092,6 +1092,20 @@ class _AsyncToolsAPI:
 # SignalVaultClient (sync, OpenAI)
 # ---------------------------------------------------------------------------
 
+def _with_stream_usage(kwargs: dict, stream: bool) -> bool:
+    """Asks OpenAI to report token usage on a stream, unless the caller set ``stream_options``.
+
+    OpenAI then sends one extra final chunk with an empty ``choices`` list.
+    Returns True when the option was added here, so the stream wrapper
+    consumes that chunk instead of passing it to a caller who never asked
+    for it. Matches the Node SDK.
+    """
+    if not stream or "stream_options" in kwargs:
+        return False
+    kwargs["stream_options"] = {"include_usage": True}
+    return True
+
+
 class _ChatCompletions:
     """Proxies `client.chat.completions.create(...)` with SignalVault guardrails."""
 
@@ -1116,13 +1130,15 @@ class _ChatCompletions:
         self._sv._enforce(request_id, decision)
         fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
-        if stream and "stream_options" not in kwargs:
-            kwargs["stream_options"] = {"include_usage": True}
+        hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
         response = self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
+            return self._wrap_stream(
+                request_id, kwargs, response, metadata, mirror=False, fallback=fallback,
+                hide_usage_chunk=hide_usage_chunk,
+            )
 
         self._sv._fire_response(
             request_id, kwargs.get("model", ""),
@@ -1134,13 +1150,14 @@ class _ChatCompletions:
         return response
 
     def _mirror(self, request_id: str, kwargs: dict, metadata: dict, stream: bool) -> Any:
-        if stream and "stream_options" not in kwargs:
-            kwargs["stream_options"] = {"include_usage": True}
+        hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
         response = self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
+            return self._wrap_stream(
+                request_id, kwargs, response, metadata, mirror=True, hide_usage_chunk=hide_usage_chunk,
+            )
 
         self._sv._fire_audit(
             request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
@@ -1153,7 +1170,7 @@ class _ChatCompletions:
 
     def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
-        metadata: dict, mirror: bool, fallback: Any = None,
+        metadata: dict, mirror: bool, fallback: Any = None, hide_usage_chunk: bool = False,
     ) -> Generator[Any, None, None]:
         chunks: List[str] = []
         prompt_tokens = 0
@@ -1167,6 +1184,9 @@ class _ChatCompletions:
                 if hasattr(chunk, "usage") and chunk.usage:
                     prompt_tokens = chunk.usage.prompt_tokens or 0
                     completion_tokens = chunk.usage.completion_tokens or 0
+                    # The usage-only final chunk the caller didn't ask for.
+                    if hide_usage_chunk and not chunk.choices:
+                        continue
                 yield chunk
         finally:
             output = "".join(chunks)
@@ -1216,7 +1236,8 @@ class SignalVaultClient(_BaseSyncClient):
             stream=True,
             sv_metadata={"tool": "stream_test"},
         ):
-            print(chunk.choices[0].delta.content or "", end="", flush=True)
+            if chunk.choices:
+                print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended for long-lived use)
         with SignalVaultClient(...) as client:
@@ -1273,13 +1294,15 @@ class _AsyncChatCompletions:
         self._sv._enforce(request_id, decision)
         fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
-        if stream and "stream_options" not in kwargs:
-            kwargs["stream_options"] = {"include_usage": True}
+        hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
         response = await self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
+            return self._wrap_stream(
+                request_id, kwargs, response, metadata, mirror=False, fallback=fallback,
+                hide_usage_chunk=hide_usage_chunk,
+            )
 
         self._sv._spawn(
             self._sv._send_response_from_parts(
@@ -1293,13 +1316,14 @@ class _AsyncChatCompletions:
         return response
 
     async def _mirror(self, request_id: str, kwargs: dict, metadata: dict, stream: bool) -> Any:
-        if stream and "stream_options" not in kwargs:
-            kwargs["stream_options"] = {"include_usage": True}
+        hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
         response = await self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
+            return self._wrap_stream(
+                request_id, kwargs, response, metadata, mirror=True, hide_usage_chunk=hide_usage_chunk,
+            )
 
         self._sv._spawn(
             self._sv._send_audit_from_parts(
@@ -1314,7 +1338,7 @@ class _AsyncChatCompletions:
 
     async def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
-        metadata: dict, mirror: bool, fallback: Any = None,
+        metadata: dict, mirror: bool, fallback: Any = None, hide_usage_chunk: bool = False,
     ) -> AsyncGenerator[Any, None]:
         chunks: List[str] = []
         prompt_tokens = 0
@@ -1328,6 +1352,9 @@ class _AsyncChatCompletions:
                 if hasattr(chunk, "usage") and chunk.usage:
                     prompt_tokens = chunk.usage.prompt_tokens or 0
                     completion_tokens = chunk.usage.completion_tokens or 0
+                    # The usage-only final chunk the caller didn't ask for.
+                    if hide_usage_chunk and not chunk.choices:
+                        continue
                 yield chunk
         finally:
             output = "".join(chunks)
@@ -1377,7 +1404,8 @@ class AsyncSignalVaultClient(_BaseAsyncClient):
             messages=[{"role": "user", "content": "Count to 3"}],
             stream=True,
         ):
-            print(chunk.choices[0].delta.content or "", end="", flush=True)
+            if chunk.choices:
+                print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended)
         async with AsyncSignalVaultClient(...) as client:

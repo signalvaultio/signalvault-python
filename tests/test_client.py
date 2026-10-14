@@ -294,6 +294,86 @@ class TestStreaming:
         assert args[2] == "Hello"  # only the first chunk was accumulated
 
 
+class TestStreamUsageChunk:
+    """The usage-only final chunk is consumed only when the SDK asked for it."""
+
+    def _chunks(self):
+        from openai.types.chat import ChatCompletionChunk
+
+        def chunk(choices, usage=None):
+            return ChatCompletionChunk.model_validate({
+                "id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "choices": choices, "usage": usage,
+            })
+
+        def choice(delta, finish_reason=None):
+            return [{"index": 0, "delta": delta, "finish_reason": finish_reason}]
+
+        return [
+            chunk(choice({"role": "assistant", "content": ""})),
+            chunk(choice({"content": "Hello"})),
+            chunk(choice({"content": " world"})),
+            chunk(choice({}, finish_reason="stop")),
+            chunk([], usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}),
+        ]
+
+    def _stream(self, client, chunks, **kwargs):
+        with patch.object(client, "_send_request", return_value=Decision()), \
+             patch.object(client._openai.chat.completions, "create", return_value=iter(chunks)) as create, \
+             patch.object(client, "_fire_response") as fire:
+            yielded = list(client.chat.completions.create(
+                model="m", messages=[{"role": "user", "content": "hi"}], stream=True, **kwargs,
+            ))
+        return yielded, create.call_args.kwargs, fire.call_args[0]
+
+    def test_injected_usage_chunk_is_consumed(self):
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
+        yielded, sent, fired = self._stream(client, self._chunks())
+        assert sent["stream_options"] == {"include_usage": True}
+        assert len(yielded) == 4
+        # The README loop, unguarded, works on every chunk the caller receives.
+        assert "".join(c.choices[0].delta.content or "" for c in yielded) == "Hello world"
+        assert fired[2:5] == ("Hello world", 10, 5)
+
+    def test_caller_requested_usage_chunk_is_passed_through(self):
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
+        yielded, sent, fired = self._stream(
+            client, self._chunks(), stream_options={"include_usage": True},
+        )
+        assert len(yielded) == 5
+        assert yielded[-1].choices == [] and yielded[-1].usage.prompt_tokens == 10
+        assert fired[2:5] == ("Hello world", 10, 5)
+
+    def test_usage_on_a_content_chunk_is_recorded(self):
+        client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
+        from openai.types import CompletionUsage
+
+        chunks = self._chunks()[:3]
+        chunks[-1].usage = CompletionUsage(prompt_tokens=7, completion_tokens=2, total_tokens=9)
+        yielded, _, fired = self._stream(client, chunks)
+        assert len(yielded) == 3
+        assert fired[2:5] == ("Hello world", 7, 2)
+
+    async def test_async_injected_usage_chunk_is_consumed(self):
+        client = AsyncSignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
+        chunks = self._chunks()
+
+        async def stream():
+            for c in chunks:
+                yield c
+
+        with patch.object(client, "_send_request", new=AsyncMock(return_value=Decision())), \
+             patch.object(client._openai.chat.completions, "create", new=AsyncMock(return_value=stream())), \
+             patch.object(client, "_send_response_from_parts", new=AsyncMock()) as send:
+            gen = await client.chat.completions.create(
+                model="m", messages=[{"role": "user", "content": "hi"}], stream=True,
+            )
+            yielded = [c async for c in gen]
+            await client.flush()
+        assert len(yielded) == 4
+        assert send.call_args[0][2:5] == ("Hello world", 10, 5)
+
+
 # ---------------------------------------------------------------------------
 # mirror_mode
 # ---------------------------------------------------------------------------

@@ -87,7 +87,8 @@ stream = client.chat.completions.create(
     stream=True,
 )
 for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # OpenAI streaming (async)
 stream = await async_client.chat.completions.create(
@@ -96,7 +97,8 @@ stream = await async_client.chat.completions.create(
     stream=True,
 )
 async for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="", flush=True)
+    if chunk.choices:
+        print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # Anthropic streaming
 stream = anthropic_client.messages.create(
@@ -109,6 +111,8 @@ for event in stream:
     if event.type == "content_block_delta":
         print(event.delta.text or "", end="", flush=True)
 ```
+
+For OpenAI streams the SDK sets `stream_options={"include_usage": True}` so it can record token counts, and consumes the extra usage-only final chunk itself. If you pass `stream_options` yourself, it is left as you set it and that chunk (with an empty `choices` list) reaches your loop. The `if chunk.choices:` guard handles that case and OpenAI-compatible providers that send chunks without choices.
 
 ## Agent Tool-Use Capture
 
