@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -889,24 +889,41 @@ class TestRealOpenAIClient:
 # ---------------------------------------------------------------------------
 
 class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
-    """An SSE response body that records whether it was closed, and can drop mid-stream."""
+    """An SSE response body that records whether it was closed.
 
-    def __init__(self, fail: bool = False):
-        events = openai_sse_events()
-        self.parts = [e.encode() for e in (events[:2] if fail else events)]
+    With ``fail`` it stops after the first event that carries "Hello" and then
+    raises ``error`` (default: a dropped connection), or with ``hang`` it waits
+    there forever (async only).
+    """
+
+    def __init__(
+        self, fail: bool = False, error: Optional[BaseException] = None,
+        hang: bool = False, events: Optional[List[str]] = None,
+    ):
+        events = openai_sse_events() if events is None else events
+        if fail or hang:
+            events = events[:next(i for i, e in enumerate(events) if '"Hello"' in e) + 1]
+        self.parts = [e.encode() for e in events]
         self.fail = fail
+        self.error = error
+        self.hang = hang
         self.closed = False
+
+    def _raise(self):
+        raise self.error if self.error is not None else httpx.ReadError("connection lost")
 
     def __iter__(self):
         yield from self.parts
         if self.fail:
-            raise httpx.ReadError("connection lost")
+            self._raise()
 
     async def __aiter__(self):
         for part in self.parts:
             yield part
+        if self.hang:
+            await asyncio.Event().wait()
         if self.fail:
-            raise httpx.ReadError("connection lost")
+            self._raise()
 
     def close(self):
         self.closed = True
@@ -944,6 +961,15 @@ def async_streaming_client(body: TrackedBody):
         http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider_handler(body))),
     )
     return client, server
+
+
+def _dropped_errors():
+    import openai
+    # openai 1.x passes the httpx error through; later versions wrap it.
+    return (httpx.ReadError, openai.APIConnectionError)
+
+
+DROPPED = _dropped_errors()
 
 
 def responses(server: Server) -> List[dict]:
@@ -1007,7 +1033,18 @@ class TestStreamLifecycle:
         body = TrackedBody(fail=True)
         client, server = streaming_client(body)
         stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
-        with pytest.raises(Exception):
+        with pytest.raises(DROPPED):
+            for _ in stream:
+                pass
+        assert body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_keyboard_interrupt_mid_stream_closes_and_records(self):
+        body = TrackedBody(fail=True, error=KeyboardInterrupt())
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(KeyboardInterrupt):
             for _ in stream:
                 pass
         assert body.closed
@@ -1045,9 +1082,98 @@ class TestStreamLifecycle:
         body = TrackedBody(fail=True)
         client, server = async_streaming_client(body)
         stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
-        with pytest.raises(Exception):
+        with pytest.raises(DROPPED):
             async for _ in stream:
                 pass
         assert body.closed
         await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_cancelled_read_closes_and_records(self):
+        body = TrackedBody(hang=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        seen = []
+
+        async def read():
+            async for chunk in stream:
+                seen.append(chunk)
+
+        task = asyncio.ensure_future(read())
+        while len(seen) < 2:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_break_then_collected_closes_and_records(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                break
+        del stream, chunk
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_close_twice_then_collected_records_once(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        await stream.__anext__()
+        await stream.close()
+        await stream.aclose()
+        assert [c async for c in stream] == []
+        del stream
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_aclose_and_aclosing(self):
+        contextlib = pytest.importorskip("contextlib")
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        if hasattr(contextlib, "aclosing"):  # Python 3.10+
+            async with contextlib.aclosing(stream):
+                await stream.__anext__()
+        else:
+            await stream.__anext__()
+            await stream.aclose()
+        assert body.closed
+        await client.flush()
+        assert len(responses(server)) == 1
+
+    # The event is sent while asyncio.run shuts the loop down, so httpx starts an
+    # async generator after shutdown_asyncgens(), which asyncio reports with a
+    # ResourceWarning. The event is still delivered, as it was with the old async generator.
+    @pytest.mark.filterwarnings("ignore::ResourceWarning")
+    def test_async_stream_left_open_is_recorded_when_the_loop_shuts_down(self):
+        body = TrackedBody()
+        kept = []
+
+        async def main():
+            client, server = async_streaming_client(body)
+            stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                    break
+            kept.append((stream, server))
+
+        asyncio.run(main())
+        _, server = kept[0]
+        assert body.closed
         assert [r["output"] for r in responses(server)] == ["Hello"]

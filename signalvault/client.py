@@ -1320,6 +1320,52 @@ class SignalVaultStream:
             pass
 
 
+class _AsyncStreamFinisher:
+    """Closes the provider stream and records the response, once.
+
+    Holds no reference to the AsyncSignalVaultStream, so the stream can be
+    collected while its event generator is still being finalized.
+    """
+
+    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+        self._upstream = upstream
+        self._collector = collector
+        self._record = record
+        self._done = False
+
+    async def __call__(self) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            close = getattr(self._upstream, "close", None) or getattr(self._upstream, "aclose", None)
+            if callable(close):
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception:
+            pass  # a failed close must not hide how the stream itself ended
+        finally:
+            c = self._collector
+            self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+
+
+async def _async_events(upstream: Any, collector: _ChunkCollector, finish: _AsyncStreamFinisher) -> Any:
+    """Drives an async provider stream for AsyncSignalVaultStream.
+
+    Python finalizes an async generator that is dropped half-read, on garbage
+    collection or when ``asyncio.run`` shuts down its loop, so the ``finally``
+    closes the provider stream and records the response even if the caller
+    stops reading without closing.
+    """
+    try:
+        async for item in upstream:
+            if collector.add(item):
+                yield item
+    finally:
+        await finish()
+
+
 class AsyncSignalVaultStream:
     """Returned by ``chat.completions.create(..., stream=True)`` on the async OpenAI client.
 
@@ -1329,10 +1375,8 @@ class AsyncSignalVaultStream:
 
     def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
         self._upstream = upstream
-        self._iterator = upstream.__aiter__()
-        self._collector = collector
-        self._record = record
-        self._closed = False
+        self._finish = _AsyncStreamFinisher(upstream, collector, record)
+        self._events = _async_events(upstream, collector, self._finish)
 
     @property
     def response(self) -> Any:
@@ -1343,55 +1387,22 @@ class AsyncSignalVaultStream:
         return self
 
     async def __anext__(self) -> Any:
-        if self._closed:
-            raise StopAsyncIteration
-        try:
-            while True:
-                chunk = await self._iterator.__anext__()
-                if self._collector.add(chunk):
-                    return chunk
-        except BaseException:
-            try:
-                await self.close()
-            except Exception:
-                pass  # keep the original exception, or the normal end of the stream
-            raise
+        return await self._events.__anext__()
 
     async def close(self) -> None:
         """Closes the provider stream and records the response. Safe to call twice."""
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            close = getattr(self._upstream, "close", None)
-            if close is None:
-                close = getattr(self._upstream, "aclose", None)
-            if callable(close):
-                result = close()
-                if inspect.isawaitable(result):
-                    await result
-        finally:
-            self._finish()
+        await self._events.aclose()  # runs the generator's finally if it started
+        await self._finish()  # otherwise close and record here
 
-    def _finish(self) -> None:
-        c = self._collector
-        self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+    async def aclose(self) -> None:
+        """Same as :meth:`close`, as on ``openai.AsyncStream`` and async generators."""
+        await self.close()
 
     async def __aenter__(self) -> "AsyncSignalVaultStream":
         return self
 
     async def __aexit__(self, *exc_info: Any) -> None:
         await self.close()
-
-    def __del__(self) -> None:
-        # Can't await the provider's close() here; the response is still recorded.
-        if getattr(self, "_closed", True):
-            return
-        self._closed = True
-        try:
-            self._finish()
-        except Exception:
-            pass
 
 
 class _ChatCompletions:

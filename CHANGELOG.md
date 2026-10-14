@@ -9,11 +9,15 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Changed
+
+- OpenAI `create(..., stream=True)` returns a `SignalVaultStream` / `AsyncSignalVaultStream` instead of a generator / async generator (see Fixes). Iterating it, `close()` and `aclose()` work as before. Generator-only APIs (`send()`, `throw()`, `asend()`, `athrow()`) and `inspect.isgenerator()` / `inspect.isasyncgen()` checks no longer apply. (#15)
+
 ### Fixes
 
 - OpenAI streams (`chat.completions.create(..., stream=True)`) now return a `SignalVaultStream` (`AsyncSignalVaultStream` on the async client) instead of a plain generator, so they work like the OpenAI SDK's stream:
   - `with` / `async with` is supported; it previously raised `TypeError`.
-  - `close()` / `await close()` and `.response` are available.
+  - `close()` / `await close()` (and `await aclose()`) and `.response` are available.
   - Closing the stream, or leaving the `with` block, closes the connection to OpenAI and records the response right away. Previously the connection stayed open until garbage collection, and a stream left after `break` was only recorded then.
   - Each response is still recorded exactly once: when the stream ends, raises, or is closed.
 
