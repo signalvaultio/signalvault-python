@@ -35,7 +35,7 @@ def _make_response(status_code: int = 200, body: dict | None = None) -> MagicMoc
 
 def _post_json_calls(http_mock: MagicMock) -> list[dict]:
     """Returns the list of JSON bodies POSTed via http.post."""
-    return [call.kwargs["json"] for call in http_mock.post.call_args_list]
+    return [json.loads(call.kwargs["content"]) for call in http_mock.post.call_args_list]
 
 
 # ---------------------------------------------------------------------------

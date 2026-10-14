@@ -1,6 +1,7 @@
 """Unit tests for SignalVault Python SDK (no network calls)."""
 
 import copy
+import json
 import pytest
 import warnings
 from unittest.mock import MagicMock, patch, AsyncMock
@@ -441,7 +442,7 @@ class TestMirrorMode:
         call_order = []
 
         def mock_post(url, **kwargs):
-            event_type = kwargs.get("json", {}).get("type")
+            event_type = json.loads(kwargs["content"])["type"]
             call_order.append(event_type)
             resp = MagicMock()
             resp.status_code = 200

@@ -249,6 +249,123 @@ class TestAnthropic:
 
 
 # ---------------------------------------------------------------------------
+# Provider SDK objects in messages
+# ---------------------------------------------------------------------------
+
+
+def openai_tool_turn() -> list:
+    """The usual tool loop: the assistant message is appended as the SDK object."""
+    from openai.types.chat import ChatCompletionMessage
+
+    assistant = ChatCompletionMessage.model_validate({
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "call_1", "type": "function",
+                        "function": {"name": "weather", "arguments": '{"city": "London"}'}}],
+    })
+    return [
+        {"role": "user", "content": "Weather in London?"},
+        assistant,
+        {"role": "tool", "tool_call_id": "call_1", "content": "12C"},
+    ]
+
+
+EXPECTED_ASSISTANT = {
+    "role": "assistant", "content": None,
+    "tool_calls": [{"id": "call_1", "type": "function",
+                    "function": {"name": "weather", "arguments": '{"city": "London"}'}}],
+}
+
+
+class TestProviderObjectsInMessages:
+    def test_openai_message_object_is_scanned(self):
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server)
+        messages = openai_tool_turn()
+        client.chat.completions.create(model="m", messages=messages)
+        client.flush()
+
+        assert server.bodies[0]["payload"]["messages"][1] == EXPECTED_ASSISTANT
+        # The provider still receives the caller's objects unchanged.
+        assert client._openai.chat.completions.create.call_args.kwargs["messages"] == messages
+        assert server.types() == ["ai.request", "ai.response"]
+
+    @pytest.mark.asyncio
+    async def test_async_openai_message_object_is_scanned(self):
+        server = Server({"ai.request": [ALLOW]})
+        client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+        client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+        client._openai = MagicMock()
+
+        async def create(**_):
+            return fake_completion()
+
+        client._openai.chat.completions.create = create
+        await client.chat.completions.create(model="m", messages=openai_tool_turn())
+        await client.flush()
+        assert server.bodies[0]["payload"]["messages"][1] == EXPECTED_ASSISTANT
+
+    def test_mirror_mode_records_message_objects(self):
+        server = Server()
+        client = sync_client(server, mirror_mode=True)
+        client.chat.completions.create(model="m", messages=openai_tool_turn())
+        client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+        assert server.bodies[0]["payload"]["messages"][1] == EXPECTED_ASSISTANT
+
+    def test_anthropic_content_blocks_are_scanned(self):
+        types = pytest.importorskip("anthropic.types")
+        blocks = [
+            types.TextBlock(type="text", text="Let me check."),
+            types.ToolUseBlock(type="tool_use", id="tu_1", name="weather", input={"city": "London"}),
+        ]
+        server = Server({"ai.request": [ALLOW]})
+        client = anthropic_client(server)
+        client.messages.create(model="claude", max_tokens=5, messages=[
+            {"role": "user", "content": "Weather in London?"},
+            {"role": "assistant", "content": blocks},
+        ])
+        client.flush()
+
+        assert server.bodies[0]["payload"]["messages"][1]["content"] == [
+            {"type": "text", "text": "Let me check."},
+            {"type": "tool_use", "id": "tu_1", "name": "weather", "input": {"city": "London"}},
+        ]
+
+
+class TestUnserializableRequest:
+    def _cyclic_metadata(self):
+        loop: dict = {}
+        loop["self"] = loop
+        return {"loop": loop}
+
+    def test_fail_open_warns_and_calls_the_provider(self):
+        server = Server()
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match="could not be serialized"):
+            client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata=self._cyclic_metadata())
+        client.flush()
+        assert client._openai.chat.completions.create.called
+        assert server.requests == []
+
+    def test_fail_closed_raises(self):
+        server = Server()
+        client = sync_client(server, fail_mode="closed")
+        with pytest.raises(SignalVaultUnavailableError, match="could not be serialized"):
+            client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata=self._cyclic_metadata())
+        assert not client._openai.chat.completions.create.called
+
+    def test_mirror_mode_warns_instead_of_dropping_silently(self):
+        server = Server()
+        client = sync_client(server, mirror_mode=True)
+        with pytest.warns(SignalVaultWarning, match="event dropped: it could not be serialized") as record:
+            client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata=self._cyclic_metadata())
+            client.flush()
+        assert server.requests == []
+        dropped = {str(w.message).split()[1] for w in record}
+        assert dropped == {"ai.request", "ai.response"}
+
+
+# ---------------------------------------------------------------------------
 # Background delivery
 # ---------------------------------------------------------------------------
 

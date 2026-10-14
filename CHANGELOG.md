@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixes
+
+- Provider SDK objects in `messages` no longer raise `TypeError`. The usual tool-calling loop appends `response.choices[0].message` (or Anthropic content blocks) to the conversation; these are now serialized with the fields the provider returned, as the Node SDK does. Previously the pre-flight check raised even with `fail_mode="open"`, and in mirror mode the audit event was dropped silently.
+- A request that can't be serialized at all (for example a circular reference in `sv_metadata`) now follows `fail_mode`: with `"open"` it emits a `SignalVaultWarning` and the request goes ahead, with `"closed"` it raises `SignalVaultUnavailableError`. A background event that can't be serialized is dropped with a `SignalVaultWarning` (at most once a minute per event type), not silently.
+
 ---
 
 ## [0.5.1] — 2026-10-14
