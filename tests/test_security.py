@@ -107,6 +107,64 @@ class TestBaseUrl:
 
 
 # ---------------------------------------------------------------------------
+# api_key
+# ---------------------------------------------------------------------------
+
+def anthropic_classes():
+    from signalvault import AnthropicSignalVaultClient, AsyncAnthropicSignalVaultClient
+    return [AnthropicSignalVaultClient, AsyncAnthropicSignalVaultClient]
+
+
+def build_any(cls, api_key):
+    if cls in (SignalVaultClient, AsyncSignalVaultClient):
+        return cls(api_key=api_key, openai_api_key="sk-fake")
+    with patch.dict("sys.modules", {"anthropic": MagicMock()}):
+        return cls(api_key=api_key, anthropic_api_key="sk-ant")
+
+
+class TestApiKey:
+    @pytest.mark.parametrize("raw", ["sk_test_abc\n", "sk_test_abc\r\n", "  sk_test_abc ", "\tsk_test_abc", "\ufeffsk_test_abc\n"])
+    def test_surrounding_whitespace_is_stripped_and_block_enforced(self, raw):
+        # A key read from a file used to make every pre-flight fail locally,
+        # which fail_mode="open" turned into "allow".
+        violations = [{"rule_id": "r1", "type": "contains_secret", "severity": 9, "action": "block", "details": {}}]
+        server = Server({"ai.request": [{"status": 200, "json": {
+            "decision": "block", "violations": violations, "redactions": [],
+        }}]})
+        client = SignalVaultClient(api_key=raw, openai_api_key="sk-fake")
+        client._http = httpx.Client(transport=httpx.MockTransport(server.sync_handler))
+        client._openai = MagicMock()
+        with pytest.raises(SignalVaultBlockedError):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        assert server.requests[0].headers["authorization"] == "Bearer sk_test_abc"
+        client._openai.chat.completions.create.assert_not_called()
+
+    @pytest.mark.parametrize("bad,pattern", [
+        ("", "empty"),
+        (" \n", "empty"),
+        ("sk_test abc_SECRET", "whitespace"),
+        ("sk_test\nabc_SECRET", "whitespace"),
+        ("sk_test\x00abc_SECRET", "control"),
+        ("sk_test_abc_SECRETé", "non-ASCII"),
+    ])
+    def test_invalid_keys_are_refused_without_echoing_them(self, bad, pattern):
+        with pytest.raises(ValueError, match=pattern) as exc:
+            SignalVaultClient(api_key=bad, openai_api_key="sk-fake")
+        assert "SECRET" not in str(exc.value)
+
+    def test_non_string_key_is_a_type_error(self):
+        with pytest.raises(TypeError, match="NoneType"):
+            SignalVaultClient(api_key=None, openai_api_key="sk-fake")
+
+    @pytest.mark.parametrize("index", range(4))
+    def test_every_client_validates(self, index):
+        cls = ([SignalVaultClient, AsyncSignalVaultClient] + anthropic_classes())[index]
+        with pytest.raises(ValueError, match="whitespace"):
+            build_any(cls, "sk_test abc")
+        assert build_any(cls, "sk_test_abc\n")._config.api_key == "sk_test_abc"
+
+
+# ---------------------------------------------------------------------------
 # Headers & event_id
 # ---------------------------------------------------------------------------
 
