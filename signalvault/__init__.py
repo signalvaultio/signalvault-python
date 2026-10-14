@@ -1,7 +1,7 @@
 """SignalVault Python SDK — AI audit logs and guardrails for OpenAI and Anthropic applications."""
 
 # Defined before the imports below: client.py reads it for the User-Agent header.
-__version__ = "0.5.1"
+__version__ = "0.5.2"
 
 from .client import (  # noqa: E402
     AnthropicSignalVaultClient,
