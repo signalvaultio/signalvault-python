@@ -102,18 +102,20 @@ async with stream:
             print(chunk.choices[0].delta.content or "", end="", flush=True)
 
 # Anthropic streaming
-stream = anthropic_client.messages.create(
+with anthropic_client.messages.create(
     model="claude-3-5-sonnet-20241022",
     messages=[{"role": "user", "content": "Write a poem"}],
     max_tokens=1024,
     stream=True,
-)
-for event in stream:
-    if event.type == "content_block_delta":
-        print(event.delta.text or "", end="", flush=True)
+) as stream:
+    for event in stream:
+        if event.type == "content_block_delta" and event.delta.type == "text_delta":
+            print(event.delta.text, end="", flush=True)
 ```
 
-An OpenAI stream is recorded once: when it ends, when it raises, or when it's closed. A `for` loop doesn't close the stream on `break`, so use `with` / `async with` (or call `stream.close()` / `await stream.close()`) if you may stop reading early. That records the response and closes the connection to OpenAI right away. Without it, both happen when the stream is garbage-collected (with the async client, at the latest when `asyncio.run` finishes). Like the OpenAI SDK's stream, it also has `stream.response`, the HTTP response.
+Streams yield exactly what the provider SDK's `create(..., stream=True)` yields: OpenAI chunks, or Anthropic's raw stream events (`message_start`, `content_block_delta`, ...). The request is sent when `create()` is called, so provider errors such as an invalid key are raised there.
+
+A stream is recorded once: when it ends, when it raises, or when it's closed. A `for` loop doesn't close the stream on `break`, so use `with` / `async with` (or call `stream.close()` / `await stream.close()`) if you may stop reading early. That records the response and closes the connection to the provider right away. Without it, both happen when the stream is garbage-collected (with the async clients, at the latest when `asyncio.run` finishes). Like the provider SDK's stream, it also has `stream.response`, the HTTP response.
 
 For OpenAI streams, the SDK sets `stream_options={"include_usage": True}` so the response is logged with its token counts. OpenAI then sends one extra final chunk that carries only the usage and no choices; the SDK consumes that chunk rather than passing it to you. If you set `include_usage` yourself, your setting is kept: with `True` you receive the usage chunk, whose `choices` list is empty (hence the `if chunk.choices:` guard above), and with `False` the response is logged without token counts. Other stream options you pass are kept. If your OpenAI-compatible server (set through `OPENAI_BASE_URL`) rejects `stream_options`, pass `stream_options=None` and the SDK sends none; responses are then logged without token counts.
 

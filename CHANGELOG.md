@@ -12,6 +12,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - OpenAI `create(..., stream=True)` returns a `SignalVaultStream` / `AsyncSignalVaultStream` instead of a generator / async generator (see Fixes). Iterating it, `close()` and `aclose()` work as before. Generator-only APIs (`send()`, `throw()`, `asend()`, `athrow()`) and `inspect.isgenerator()` / `inspect.isasyncgen()` checks no longer apply. (#15)
+- Anthropic `messages.create(..., stream=True)` now calls the Anthropic SDK's `messages.create(..., stream=True)` instead of `messages.stream()`, as the Node SDK does. It yields the raw stream events, exactly as the Anthropic SDK does. **Note:** the extra events that `messages.stream()` added in recent Anthropic SDK versions (`text`, `input_json`, `citation`, ...) are no longer yielded; read the text from `content_block_delta` events instead. The request is now sent when `create()` is called, so provider errors (for example an invalid Anthropic key) are raised there rather than on the first iteration. It returns a `SignalVaultStream` / `AsyncSignalVaultStream` like the OpenAI clients. (#29)
 
 ### Fixes
 
@@ -22,6 +23,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Each response is still recorded exactly once: when the stream ends, raises, or is closed.
 
   Both classes are exported for type hints. (#15)
+- Anthropic streams get the same: `with` / `async with`, `close()`, `.response`, an immediate close and record on `close()` or at the end of the `with` block, and exactly one recorded response. (#29)
 
 ---
 

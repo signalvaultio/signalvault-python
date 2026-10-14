@@ -1177,3 +1177,188 @@ class TestStreamLifecycle:
         _, server = kept[0]
         assert body.closed
         assert [r["output"] for r in responses(server)] == ["Hello"]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic streams (real anthropic.Stream / AsyncStream)
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_EVENT_TYPES = [
+    "message_start", "content_block_start", "content_block_delta",
+    "content_block_stop", "message_delta", "message_stop",
+]
+
+
+def anthropic_sse_events() -> List[str]:
+    def event(data):
+        return f"event: {data['type']}\ndata: {json.dumps(data)}\n\n"
+
+    return [
+        event({"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "content": [], "model": "claude",
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 7, "output_tokens": 1},
+        }}),
+        event({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        event({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}),
+        event({"type": "content_block_stop", "index": 0}),
+        event({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+               "usage": {"output_tokens": 2}}),
+        event({"type": "message_stop"}),
+    ]
+
+
+def anthropic_httpx():
+    """The HTTP library the installed anthropic SDK uses: httpx2 in recent versions, httpx before."""
+    import anthropic._base_client as base
+
+    return getattr(base, "httpx2", None) or base.httpx
+
+
+class AnthropicProvider:
+    """Answers like Anthropic's streaming Messages API and records the requests."""
+
+    def __init__(self, fail: bool = False, status: int = 200):
+        hx = anthropic_httpx()
+        body_class = TrackedBody
+        if hx is not httpx:  # httpx2 only accepts its own stream classes
+            body_class = type("TrackedBody", (TrackedBody, hx.SyncByteStream, hx.AsyncByteStream), {})
+        self.body = body_class(fail=fail, events=anthropic_sse_events())
+        self.status = status
+        self.requests: List[dict] = []
+
+    def handler(self, request):
+        hx = anthropic_httpx()
+        self.requests.append(json.loads(request.content))
+        if self.status != 200:
+            error = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+            return hx.Response(self.status, json=error)
+        return hx.Response(200, headers={"content-type": "text/event-stream"}, stream=self.body)
+
+
+def anthropic_streaming_client(provider: AnthropicProvider, mirror: bool = False):
+    import anthropic
+    from signalvault import AnthropicSignalVaultClient
+
+    server = Server({"ai.request": [ALLOW]})
+    client = AnthropicSignalVaultClient(api_key="k", anthropic_api_key="sk-ant", mirror_mode=mirror)
+    client._http = httpx.Client(transport=httpx.MockTransport(server.sync_handler))
+    hx = anthropic_httpx()
+    client._anthropic = anthropic.Anthropic(
+        api_key="sk-ant", base_url="http://provider.test", max_retries=0,
+        http_client=hx.Client(transport=hx.MockTransport(provider.handler)),
+    )
+    return client, server
+
+
+def async_anthropic_streaming_client(provider: AnthropicProvider):
+    import anthropic
+    from signalvault import AsyncAnthropicSignalVaultClient
+
+    server = Server({"ai.request": [ALLOW]})
+    client = AsyncAnthropicSignalVaultClient(api_key="k", anthropic_api_key="sk-ant")
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+    hx = anthropic_httpx()
+    client._anthropic = anthropic.AsyncAnthropic(
+        api_key="sk-ant", base_url="http://provider.test", max_retries=0,
+        http_client=hx.AsyncClient(transport=hx.MockTransport(provider.handler)),
+    )
+    return client, server
+
+
+def anthropic_create(client, **kw):
+    return client.messages.create(model="claude", max_tokens=10, messages=MESSAGES, stream=True, **kw)
+
+
+def read_until_hello_event(stream) -> None:
+    for event in stream:
+        if event.type == "content_block_delta":
+            break
+
+
+class TestAnthropicStream:
+    def test_yields_the_raw_events_and_records_the_response(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider)
+        stream = anthropic_create(client)
+        assert isinstance(stream, signalvault.SignalVaultStream)
+        assert [e.type for e in stream] == ANTHROPIC_EVENT_TYPES
+        assert provider.requests[0]["stream"] is True
+        assert provider.body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+
+    def test_request_is_sent_by_create_and_provider_errors_raise_there(self):
+        import anthropic
+
+        provider = AnthropicProvider()
+        client, _ = anthropic_streaming_client(provider)
+        anthropic_create(client)
+        assert len(provider.requests) == 1
+
+        client, _ = anthropic_streaming_client(AnthropicProvider(status=401))
+        with pytest.raises(anthropic.AuthenticationError):
+            anthropic_create(client)
+
+    def test_with_block_closes_and_records_on_break(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider)
+        with anthropic_create(client) as stream:
+            assert stream.response.status_code == 200
+            read_until_hello_event(stream)
+            assert not provider.body.closed
+        assert provider.body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 0}
+
+    def test_error_mid_stream_closes_records_and_raises(self):
+        provider = AnthropicProvider(fail=True)
+        client, server = anthropic_streaming_client(provider)
+        stream = anthropic_create(client)
+        with pytest.raises(Exception):
+            for _ in stream:
+                pass
+        assert provider.body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_mirror_mode(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider, mirror=True)
+        with anthropic_create(client, system="SYS") as stream:
+            assert [e.type for e in stream] == ANTHROPIC_EVENT_TYPES
+        client.flush()
+        assert provider.requests[0]["system"] == "SYS"
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_async_stream(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider)
+        stream = await anthropic_create(client)
+        assert isinstance(stream, signalvault.AsyncSignalVaultStream)
+        assert len(provider.requests) == 1
+        async with stream:
+            assert [e.type async for e in stream] == ANTHROPIC_EVENT_TYPES
+        assert provider.body.closed
+        await client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+
+    @pytest.mark.asyncio
+    async def test_async_with_block_closes_and_records_on_break(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider)
+        async with await anthropic_create(client) as stream:
+            async for event in stream:
+                if event.type == "content_block_delta":
+                    break
+            assert not provider.body.closed
+        assert provider.body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]

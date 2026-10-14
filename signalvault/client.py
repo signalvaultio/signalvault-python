@@ -24,7 +24,7 @@ import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncGenerator, Awaitable, Callable, Dict, Generator, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -1230,13 +1230,27 @@ def _with_stream_usage(kwargs: dict, stream: bool) -> bool:
     return True
 
 
-class _ChunkCollector:
-    """Collects the text and token usage of an OpenAI stream."""
+class _StreamCollector:
+    """Collects the text and token usage of a provider stream."""
 
-    def __init__(self, hide_usage_chunk: bool):
+    def __init__(self) -> None:
         self.parts: List[str] = []
         self.prompt_tokens = 0
         self.completion_tokens = 0
+
+    def add(self, item: Any) -> bool:
+        """Records an item. Returns False to keep it from the caller."""
+        raise NotImplementedError
+
+    def result(self) -> Tuple[str, int, int]:
+        return "".join(self.parts), self.prompt_tokens, self.completion_tokens
+
+
+class _ChunkCollector(_StreamCollector):
+    """OpenAI chat completion chunks."""
+
+    def __init__(self, hide_usage_chunk: bool):
+        super().__init__()
         self._hide_usage_chunk = hide_usage_chunk
 
     def add(self, chunk: Any) -> bool:
@@ -1252,8 +1266,28 @@ class _ChunkCollector:
         return True
 
 
+class _AnthropicEventCollector(_StreamCollector):
+    """Anthropic message stream events. Every event reaches the caller."""
+
+    def add(self, event: Any) -> bool:
+        kind = getattr(event, "type", None)
+        if kind == "content_block_delta":
+            delta = getattr(event, "delta", None)
+            if getattr(delta, "type", None) == "text_delta":
+                self.parts.append(getattr(delta, "text", "") or "")
+        elif kind == "message_start":
+            usage = getattr(getattr(event, "message", None), "usage", None)
+            if usage:
+                self.prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+        elif kind == "message_delta":
+            usage = getattr(event, "usage", None)
+            if usage:
+                self.completion_tokens = getattr(usage, "output_tokens", 0) or 0
+        return True
+
+
 class SignalVaultStream:
-    """Returned by ``chat.completions.create(..., stream=True)`` on the sync OpenAI client.
+    """Returned by ``create(..., stream=True)`` on the sync OpenAI and Anthropic clients.
 
     Iterates the provider's stream and records the response once: when the
     stream ends, raises, or is closed. A ``for`` loop doesn't close its
@@ -1262,7 +1296,7 @@ class SignalVaultStream:
     garbage-collected.
     """
 
-    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
         self._upstream = upstream
         self._iterator = iter(upstream)
         self._collector = collector
@@ -1271,7 +1305,7 @@ class SignalVaultStream:
 
     @property
     def response(self) -> Any:
-        """The provider's HTTP response (``openai.Stream.response``)."""
+        """The provider's HTTP response (``Stream.response`` in the provider SDK)."""
         return self._upstream.response
 
     def __iter__(self) -> "SignalVaultStream":
@@ -1302,8 +1336,7 @@ class SignalVaultStream:
             if callable(close):
                 close()
         finally:
-            c = self._collector
-            self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+            self._record(*self._collector.result())
 
     def __enter__(self) -> "SignalVaultStream":
         return self
@@ -1327,7 +1360,7 @@ class _AsyncStreamFinisher:
     collected while its event generator is still being finalized.
     """
 
-    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
         self._upstream = upstream
         self._collector = collector
         self._record = record
@@ -1346,11 +1379,10 @@ class _AsyncStreamFinisher:
         except Exception:
             pass  # a failed close must not hide how the stream itself ended
         finally:
-            c = self._collector
-            self._record("".join(c.parts), c.prompt_tokens, c.completion_tokens)
+            self._record(*self._collector.result())
 
 
-async def _async_events(upstream: Any, collector: _ChunkCollector, finish: _AsyncStreamFinisher) -> Any:
+async def _async_events(upstream: Any, collector: _StreamCollector, finish: _AsyncStreamFinisher) -> Any:
     """Drives an async provider stream for AsyncSignalVaultStream.
 
     Python finalizes an async generator that is dropped half-read, on garbage
@@ -1367,20 +1399,20 @@ async def _async_events(upstream: Any, collector: _ChunkCollector, finish: _Asyn
 
 
 class AsyncSignalVaultStream:
-    """Returned by ``chat.completions.create(..., stream=True)`` on the async OpenAI client.
+    """Returned by ``create(..., stream=True)`` on the async OpenAI and Anthropic clients.
 
     The async counterpart of :class:`SignalVaultStream`. Use ``async with``
     (or ``await stream.close()``) when you may stop early.
     """
 
-    def __init__(self, upstream: Any, collector: _ChunkCollector, record: Callable[[str, int, int], None]):
+    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
         self._upstream = upstream
         self._finish = _AsyncStreamFinisher(upstream, collector, record)
         self._events = _async_events(upstream, collector, self._finish)
 
     @property
     def response(self) -> Any:
-        """The provider's HTTP response (``openai.AsyncStream.response``)."""
+        """The provider's HTTP response (``AsyncStream.response`` in the provider SDK)."""
         return self._upstream.response
 
     def __aiter__(self) -> "AsyncSignalVaultStream":
@@ -1395,7 +1427,7 @@ class AsyncSignalVaultStream:
         await self._finish()  # otherwise close and record here
 
     async def aclose(self) -> None:
-        """Same as :meth:`close`, as on ``openai.AsyncStream`` and async generators."""
+        """Same as :meth:`close`, as on the provider SDK's ``AsyncStream`` and on async generators."""
         await self.close()
 
     async def __aenter__(self) -> "AsyncSignalVaultStream":
@@ -1515,14 +1547,15 @@ class SignalVaultClient(_BaseSyncClient):
         )
 
         # Streaming
-        for chunk in client.chat.completions.create(
+        with client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": "Count to 3"}],
             stream=True,
             sv_metadata={"tool": "stream_test"},
-        ):
-            if chunk.choices:
-                print(chunk.choices[0].delta.content or "", end="", flush=True)
+        ) as stream:
+            for chunk in stream:
+                if chunk.choices:
+                    print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended for long-lived use)
         with SignalVaultClient(...) as client:
@@ -1669,13 +1702,14 @@ class AsyncSignalVaultClient(_BaseAsyncClient):
         )
 
         # Streaming
-        async for chunk in await client.chat.completions.create(
+        async with await client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": "Count to 3"}],
             stream=True,
-        ):
-            if chunk.choices:
-                print(chunk.choices[0].delta.content or "", end="", flush=True)
+        ) as stream:
+            async for chunk in stream:
+                if chunk.choices:
+                    print(chunk.choices[0].delta.content or "", end="", flush=True)
 
         # Context manager (recommended)
         async with AsyncSignalVaultClient(...) as client:
@@ -1732,13 +1766,11 @@ class _AnthropicMessages:
         self._sv._enforce(request_id, decision)
         fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
-        if stream:
-            # Use the streaming context manager to get a proper event iterator
-            kwargs.pop("stream", None)
-            stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False, fallback=fallback)
-
         response = self._sv._anthropic.messages.create(**kwargs)
+
+        if stream:
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
+
         self._sv._fire_response(
             request_id, kwargs.get("model", ""),
             _anthropic_output_text(response),
@@ -1749,12 +1781,11 @@ class _AnthropicMessages:
         return response
 
     def _mirror(self, request_id: str, kwargs: dict, metadata: dict, stream: bool) -> Any:
-        if stream:
-            kwargs.pop("stream", None)
-            stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=True)
-
         response = self._sv._anthropic.messages.create(**kwargs)
+
+        if stream:
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
+
         self._sv._fire_audit(
             request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
             _anthropic_output_text(response),
@@ -1765,30 +1796,12 @@ class _AnthropicMessages:
         return response
 
     def _wrap_stream(
-        self, request_id: str, kwargs: dict, stream_ctx: Any,
+        self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None,
-    ) -> Generator[Any, None, None]:
-        chunks: List[str] = []
-        input_tokens = 0
-        output_tokens = 0
+    ) -> SignalVaultStream:
+        model = kwargs.get("model", "")
 
-        try:
-            with stream_ctx as stream:
-                for event in stream:
-                    if hasattr(event, "type"):
-                        if event.type == "content_block_delta" and hasattr(event, "delta"):
-                            if getattr(event.delta, "type", None) == "text_delta":
-                                chunks.append(getattr(event.delta, "text", "") or "")
-                        elif event.type == "message_start" and hasattr(event, "message"):
-                            usage = getattr(event.message, "usage", None)
-                            if usage:
-                                input_tokens = getattr(usage, "input_tokens", 0) or 0
-                        elif event.type == "message_delta" and hasattr(event, "usage"):
-                            output_tokens = getattr(event.usage, "output_tokens", 0) or 0
-                    yield event
-        finally:
-            output = "".join(chunks)
-            model = kwargs.get("model", "")
+        def record(output: str, input_tokens: int, output_tokens: int) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
@@ -1798,6 +1811,8 @@ class _AnthropicMessages:
                 self._sv._fire_response(
                     request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
                 )
+
+        return SignalVaultStream(stream, _AnthropicEventCollector(), record)
 
 
 class AnthropicSignalVaultClient(_BaseSyncClient):
@@ -1825,14 +1840,15 @@ class AnthropicSignalVaultClient(_BaseSyncClient):
         )
 
         # Streaming
-        for event in client.messages.create(
+        with client.messages.create(
             model="claude-3-5-sonnet-20241022",
             messages=[{"role": "user", "content": "Count to 3"}],
             max_tokens=1024,
             stream=True,
-        ):
-            if event.type == "content_block_delta":
-                print(event.delta.text or "", end="", flush=True)
+        ) as stream:
+            for event in stream:
+                if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    print(event.delta.text, end="", flush=True)
 
         # Context manager (recommended)
         with AnthropicSignalVaultClient(...) as client:
@@ -1897,12 +1913,11 @@ class _AsyncAnthropicMessages:
         self._sv._enforce(request_id, decision)
         fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
 
-        if stream:
-            kwargs.pop("stream", None)
-            stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=False, fallback=fallback)
-
         response = await self._sv._anthropic.messages.create(**kwargs)
+
+        if stream:
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
+
         self._sv._spawn(
             self._sv._send_response_from_parts(
                 request_id, kwargs.get("model", ""),
@@ -1915,12 +1930,11 @@ class _AsyncAnthropicMessages:
         return response
 
     async def _mirror(self, request_id: str, kwargs: dict, metadata: dict, stream: bool) -> Any:
-        if stream:
-            kwargs.pop("stream", None)
-            stream_ctx = self._sv._anthropic.messages.stream(**kwargs)
-            return self._wrap_stream(request_id, kwargs, stream_ctx, metadata, mirror=True)
-
         response = await self._sv._anthropic.messages.create(**kwargs)
+
+        if stream:
+            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
+
         self._sv._spawn(
             self._sv._send_audit_from_parts(
                 request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
@@ -1932,32 +1946,14 @@ class _AsyncAnthropicMessages:
         )
         return response
 
-    async def _wrap_stream(
-        self, request_id: str, kwargs: dict, stream_ctx: Any,
+    def _wrap_stream(
+        self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None,
-    ) -> AsyncGenerator[Any, None]:
-        chunks: List[str] = []
-        input_tokens = 0
-        output_tokens = 0
+    ) -> AsyncSignalVaultStream:
+        model = kwargs.get("model", "")
 
-        try:
-            async with stream_ctx as stream:
-                async for event in stream:
-                    if hasattr(event, "type"):
-                        if event.type == "content_block_delta" and hasattr(event, "delta"):
-                            if getattr(event.delta, "type", None) == "text_delta":
-                                chunks.append(getattr(event.delta, "text", "") or "")
-                        elif event.type == "message_start" and hasattr(event, "message"):
-                            usage = getattr(event.message, "usage", None)
-                            if usage:
-                                input_tokens = getattr(usage, "input_tokens", 0) or 0
-                        elif event.type == "message_delta" and hasattr(event, "usage"):
-                            output_tokens = getattr(event.usage, "output_tokens", 0) or 0
-                    yield event
-        finally:
-            output = "".join(chunks)
-            model = kwargs.get("model", "")
-            coro = (
+        def record(output: str, input_tokens: int, output_tokens: int) -> None:
+            self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, input_tokens, output_tokens, metadata,
@@ -1967,7 +1963,8 @@ class _AsyncAnthropicMessages:
                     request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
                 )
             )
-            self._sv._spawn(coro)
+
+        return AsyncSignalVaultStream(stream, _AnthropicEventCollector(), record)
 
 
 class AsyncAnthropicSignalVaultClient(_BaseAsyncClient):
