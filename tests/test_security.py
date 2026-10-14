@@ -123,7 +123,7 @@ def build_any(cls, api_key):
 
 
 class TestApiKey:
-    @pytest.mark.parametrize("raw", ["sk_test_abc\n", "sk_test_abc\r\n", "  sk_test_abc ", "\tsk_test_abc"])
+    @pytest.mark.parametrize("raw", ["sk_test_abc\n", "sk_test_abc\r\n", "  sk_test_abc ", "\tsk_test_abc", "\ufeffsk_test_abc\n"])
     def test_surrounding_whitespace_is_stripped_and_block_enforced(self, raw):
         # A key read from a file used to make every pre-flight fail locally,
         # which fail_mode="open" turned into "allow".

@@ -200,7 +200,7 @@ def _normalize_api_key(raw: Any) -> str:
     """
     if not isinstance(raw, str):
         raise TypeError(f"[SignalVault] api_key must be a string, got {type(raw).__name__}")
-    key = raw.strip()
+    key = raw.lstrip("\ufeff").strip()  # a BOM from a file saved by some editors
     if not key:
         raise ValueError("[SignalVault] api_key is empty")
     if any(not "\x21" <= ch <= "\x7e" for ch in key):
