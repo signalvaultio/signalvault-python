@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import warnings
-from typing import Dict, List
+from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -819,21 +820,25 @@ class OpenAIStreamServer:
         return openai_sse()
 
 
-def openai_sse() -> httpx.Response:
+def openai_sse_events() -> List[str]:
     def chunk(choices, usage=None):
         body = {"id": "c", "object": "chat.completion.chunk", "created": 0, "model": "m", "choices": choices}
         if usage:
             body["usage"] = usage
         return f"data: {json.dumps(body)}\n\n"
 
-    events = [
+    return [
         chunk([{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]),
         chunk([{"index": 0, "delta": {"content": "Hello"}, "finish_reason": None}]),
         chunk([{"index": 0, "delta": {}, "finish_reason": "stop"}]),
         chunk([], usage={"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}),
         "data: [DONE]\n\n",
     ]
-    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content="".join(events).encode())
+
+
+def openai_sse() -> httpx.Response:
+    content = "".join(openai_sse_events()).encode()
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=content)
 
 
 class TestRealOpenAIClient:
@@ -878,3 +883,719 @@ class TestRealOpenAIClient:
         assert provider.bodies[0]["stream_options"] == {"include_usage": True}
         assert text == "Hello"
         assert server.bodies[1]["payload"]["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+
+# ---------------------------------------------------------------------------
+# OpenAI stream lifecycle (real openai.Stream / AsyncStream)
+# ---------------------------------------------------------------------------
+
+class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
+    """An SSE response body that records whether it was closed.
+
+    With ``fail`` it stops after the first event that carries "Hello" and then
+    raises ``error`` (default: a dropped connection), or with ``hang`` it waits
+    there until it's closed and then raises like a dropped connection (async only).
+    """
+
+    def __init__(
+        self, fail: bool = False, error: Optional[BaseException] = None,
+        hang: bool = False, events: Optional[List[str]] = None, close_delay: float = 0.0,
+    ):
+        events = openai_sse_events() if events is None else events
+        if fail or hang:
+            events = events[:next(i for i, e in enumerate(events) if '"Hello"' in e) + 1]
+        self.parts = [e.encode() for e in events]
+        self.fail = fail
+        self.error = error
+        self.hang = hang
+        self.closed = False
+        self._closing: Optional[asyncio.Event] = None
+        self.close_delay = close_delay
+
+    def _raise(self):
+        raise self.error if self.error is not None else httpx.ReadError("connection lost")
+
+    def __iter__(self):
+        yield from self.parts
+        if self.fail:
+            self._raise()
+
+    async def __aiter__(self):
+        for part in self.parts:
+            yield part
+        if self.hang:
+            self._closing = asyncio.Event()
+            await self._closing.wait()
+            self._raise()
+        if self.fail:
+            self._raise()
+
+    def close(self):
+        self.closed = True
+
+    async def aclose(self):
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
+        self.closed = True
+        if self._closing is not None:
+            self._closing.set()
+
+
+def provider_handler(body: TrackedBody):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=body)
+    return handler
+
+
+def streaming_client(body: TrackedBody, mirror: bool = False):
+    import openai
+
+    server = Server({"ai.request": [ALLOW]})
+    client = sync_client(server, mirror_mode=mirror)
+    client._openai = openai.OpenAI(
+        api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(provider_handler(body))),
+    )
+    return client, server
+
+
+def async_streaming_client(body: TrackedBody):
+    import openai
+
+    server = Server({"ai.request": [ALLOW]})
+    client = AsyncSignalVaultClient(api_key="k", openai_api_key="x")
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+    client._openai = openai.AsyncOpenAI(
+        api_key="sk-fake", base_url="http://provider.test/v1", max_retries=0,
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(provider_handler(body))),
+    )
+    return client, server
+
+
+def _dropped_errors():
+    import openai
+    # openai 1.x passes the httpx error through; later versions wrap it.
+    return (httpx.ReadError, openai.APIConnectionError)
+
+
+DROPPED = _dropped_errors()
+
+
+def responses(server: Server) -> List[dict]:
+    return [b["payload"] for b in server.bodies if b["type"] == "ai.response"]
+
+
+def read_until_hello(stream) -> None:
+    for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta.content == "Hello":
+            break
+
+
+class TestStreamLifecycle:
+    def test_with_block_closes_and_records_on_break(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        with client.chat.completions.create(model="m", messages=MESSAGES, stream=True) as stream:
+            assert isinstance(stream, signalvault.SignalVaultStream)
+            assert stream.response.status_code == 200
+            read_until_hello(stream)
+            assert not body.closed
+        assert body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+
+    def test_close_records_once(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+        stream.close()
+        stream.close()
+        assert list(stream) == []
+        del stream
+        client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    def test_close_from_two_threads_records_once(self, monkeypatch):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+
+        # Each close() that reads _closed as False waits for the other thread
+        # to read it too, so without the lock both see False and record.
+        state = {"closed": False}
+        both_read = threading.Barrier(2, timeout=0.5)
+
+        def get_closed(_):
+            closed = state["closed"]
+            if not closed:
+                try:
+                    both_read.wait()
+                except threading.BrokenBarrierError:
+                    pass  # the other thread is waiting for the lock
+            return closed
+
+        def set_closed(_, value):
+            state["closed"] = value
+
+        monkeypatch.setattr(signalvault.SignalVaultStream, "_closed", property(get_closed, set_closed), raising=False)
+        threads = [threading.Thread(target=stream.close) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        del stream
+        client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    def test_break_without_close_records_when_collected(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+        del stream
+        client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_exhausted_stream_records_and_closes(self):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        assert len(list(stream)) == 3
+        assert body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {"prompt_tokens": 3, "completion_tokens": 1}
+
+    def test_error_mid_stream_closes_records_and_raises(self):
+        body = TrackedBody(fail=True)
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(DROPPED):
+            for _ in stream:
+                pass
+        assert body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_keyboard_interrupt_mid_stream_closes_and_records(self):
+        body = TrackedBody(fail=True, error=KeyboardInterrupt())
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(KeyboardInterrupt):
+            for _ in stream:
+                pass
+        assert body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_mirror_mode_records_on_with_exit(self):
+        body = TrackedBody()
+        client, server = streaming_client(body, mirror=True)
+        with client.chat.completions.create(model="m", messages=MESSAGES, stream=True) as stream:
+            read_until_hello(stream)
+        client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_with_block_closes_and_records_on_break(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        assert isinstance(stream, signalvault.AsyncSignalVaultStream)
+        async with stream:
+            assert stream.response.status_code == 200
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                    break
+            assert not body.closed
+        assert body.closed
+        await stream.close()
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_error_mid_stream_closes_records_and_raises(self):
+        body = TrackedBody(fail=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        with pytest.raises(DROPPED):
+            async for _ in stream:
+                pass
+        assert body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_cancelled_read_closes_and_records(self):
+        body = TrackedBody(hang=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        seen = []
+
+        async def read():
+            async for chunk in stream:
+                seen.append(chunk)
+
+        task = asyncio.ensure_future(read())
+        while len(seen) < 2:
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_break_then_collected_closes_and_records(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                break
+        del stream, chunk
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_unread_stream_is_closed_and_recorded_when_collected(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        del stream
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert body.closed
+        assert server.types() == ["ai.request", "ai.response"]
+
+    @pytest.mark.asyncio
+    async def test_async_stream_built_directly_yields_only_upstream_items(self):
+        from signalvault.client import _AnthropicEventCollector
+
+        class Upstream:
+            async def __aiter__(self):
+                yield MagicMock(type="message_stop")
+
+            async def close(self):
+                pass
+
+        recorded = []
+        stream = signalvault.AsyncSignalVaultStream(Upstream(), _AnthropicEventCollector(), lambda *r: recorded.append(r))
+        assert [e.type async for e in stream] == ["message_stop"]
+        assert recorded == [("", 0, 0)]
+
+    @pytest.mark.asyncio
+    async def test_async_close_while_another_task_reads(self):
+        body = TrackedBody(hang=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+
+        async def read():
+            async for _ in stream:
+                pass
+
+        reader = asyncio.ensure_future(read())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not reader.done()  # waiting on the provider
+        await stream.close()
+        assert body.closed
+        with pytest.raises(DROPPED):
+            await asyncio.wait_for(reader, timeout=1)  # the close ended the read
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_overlapping_closes_record_once(self):
+        body = TrackedBody(close_delay=0.01)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        await stream.__anext__()
+        await asyncio.gather(stream.close(), stream.close())
+        assert body.closed
+        await client.flush()
+        assert len(responses(server)) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_close_and_end_of_stream_do_not_wait_for_signalvault(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        server.replies["ai.request"] = [ALLOW, ALLOW]
+        streams = [await client.chat.completions.create(model="m", messages=MESSAGES, stream=True) for _ in range(2)]
+        server.delay = 1.0  # the audit sends are slow
+        start = time.monotonic()
+        await streams[0].close()
+        assert [c async for c in streams[1]]
+        assert time.monotonic() - start < 0.5
+        await client.flush()
+        assert len(responses(server)) == 2
+
+    @pytest.mark.asyncio
+    async def test_async_close_twice_then_collected_records_once(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        await stream.__anext__()
+        await stream.close()
+        await stream.aclose()
+        assert [c async for c in stream] == []
+        del stream
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_aclose_and_aclosing(self):
+        contextlib = pytest.importorskip("contextlib")
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        if hasattr(contextlib, "aclosing"):  # Python 3.10+
+            async with contextlib.aclosing(stream):
+                await stream.__anext__()
+        else:
+            await stream.__anext__()
+            await stream.aclose()
+        assert body.closed
+        await client.flush()
+        assert len(responses(server)) == 1
+
+    # The event is sent while asyncio.run shuts the loop down, so httpx starts an
+    # async generator after shutdown_asyncgens(), which asyncio reports with a
+    # ResourceWarning. The event is still delivered, as it was with the old async generator.
+    @pytest.mark.filterwarnings("ignore::ResourceWarning")
+    def test_async_stream_left_open_is_recorded_when_the_loop_shuts_down(self):
+        body = TrackedBody()
+        kept = []
+
+        async def main():
+            client, server = async_streaming_client(body)
+            server.delay = 0.05  # the send takes time, as over a network
+            stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+            async for chunk in stream:
+                if chunk.choices and chunk.choices[0].delta.content == "Hello":
+                    break
+            kept.append((stream, server))
+
+        asyncio.run(main())
+        _, server = kept[0]
+        assert body.closed
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic streams (real anthropic.Stream / AsyncStream)
+# ---------------------------------------------------------------------------
+
+ANTHROPIC_EVENT_TYPES = [
+    "message_start", "content_block_start", "content_block_delta",
+    "content_block_stop", "message_delta", "message_stop",
+]
+
+
+def anthropic_sse_events() -> List[str]:
+    def event(data):
+        return f"event: {data['type']}\ndata: {json.dumps(data)}\n\n"
+
+    return [
+        event({"type": "message_start", "message": {
+            "id": "msg_1", "type": "message", "role": "assistant", "content": [], "model": "claude",
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 7, "output_tokens": 1},
+        }}),
+        event({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        event({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}),
+        event({"type": "content_block_stop", "index": 0}),
+        event({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+               "usage": {"output_tokens": 2}}),
+        event({"type": "message_stop"}),
+    ]
+
+
+def anthropic_httpx():
+    """The HTTP library the installed anthropic SDK uses: httpx2 in recent versions, httpx before."""
+    import anthropic._base_client as base
+
+    return getattr(base, "httpx2", None) or base.httpx
+
+
+class AnthropicProvider:
+    """Answers like Anthropic's streaming Messages API and records the requests."""
+
+    def __init__(self, fail: bool = False, status: int = 200):
+        hx = anthropic_httpx()
+        body_class = TrackedBody
+        if hx is not httpx:  # httpx2 only accepts its own stream classes
+            body_class = type("TrackedBody", (TrackedBody, hx.SyncByteStream, hx.AsyncByteStream), {})
+        self.body = body_class(fail=fail, events=anthropic_sse_events())
+        self.status = status
+        self.requests: List[dict] = []
+
+    def handler(self, request):
+        hx = anthropic_httpx()
+        self.requests.append(json.loads(request.content))
+        if self.status != 200:
+            error = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
+            return hx.Response(self.status, json=error)
+        return hx.Response(200, headers={"content-type": "text/event-stream"}, stream=self.body)
+
+
+def anthropic_streaming_client(provider: AnthropicProvider, mirror: bool = False, preflight: Optional[dict] = None):
+    import anthropic
+    from signalvault import AnthropicSignalVaultClient
+
+    server = Server({"ai.request": [preflight or ALLOW]})
+    client = AnthropicSignalVaultClient(api_key="k", anthropic_api_key="sk-ant", mirror_mode=mirror)
+    client._http = httpx.Client(transport=httpx.MockTransport(server.sync_handler))
+    hx = anthropic_httpx()
+    client._anthropic = anthropic.Anthropic(
+        api_key="sk-ant", base_url="http://provider.test", max_retries=0,
+        http_client=hx.Client(transport=hx.MockTransport(provider.handler)),
+    )
+    return client, server
+
+
+def async_anthropic_streaming_client(
+    provider: AnthropicProvider, mirror: bool = False, preflight: Optional[dict] = None,
+):
+    import anthropic
+    from signalvault import AsyncAnthropicSignalVaultClient
+
+    server = Server({"ai.request": [preflight or ALLOW]})
+    client = AsyncAnthropicSignalVaultClient(api_key="k", anthropic_api_key="sk-ant", mirror_mode=mirror)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+    hx = anthropic_httpx()
+    client._anthropic = anthropic.AsyncAnthropic(
+        api_key="sk-ant", base_url="http://provider.test", max_retries=0,
+        http_client=hx.AsyncClient(transport=hx.MockTransport(provider.handler)),
+    )
+    return client, server
+
+
+def anthropic_create(client, **kw):
+    return client.messages.create(model="claude", max_tokens=10, messages=MESSAGES, stream=True, **kw)
+
+
+UNAVAILABLE = {"status": 503}
+
+# The SignalVault events each mode sends for one streamed call.
+STREAM_EVENTS = {
+    "normal": ["ai.request", "ai.response"],
+    "mirror": ["ai.request", "ai.response"],
+    "preflight_unavailable": ["ai.request", "ai.request", "ai.response"],
+}
+
+
+def stream_mode_client(factory, provider: AnthropicProvider, mode: str):
+    return factory(provider, mirror=mode == "mirror", preflight=UNAVAILABLE if mode == "preflight_unavailable" else None)
+
+
+def read_until_hello_event(stream) -> None:
+    for event in stream:
+        if event.type == "content_block_delta":
+            break
+
+
+class TestAnthropicStream:
+    def test_yields_the_raw_events_and_records_the_response(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider)
+        stream = anthropic_create(client)
+        assert isinstance(stream, signalvault.SignalVaultStream)
+        assert [e.type for e in stream] == ANTHROPIC_EVENT_TYPES
+        assert provider.requests[0]["stream"] is True
+        assert provider.body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+
+    def test_request_is_sent_by_create_and_provider_errors_raise_there(self):
+        import anthropic
+
+        provider = AnthropicProvider()
+        client, _ = anthropic_streaming_client(provider)
+        anthropic_create(client)
+        assert len(provider.requests) == 1
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_provider_error_at_create_records_no_response(self, mirror):
+        import anthropic
+
+        client, server = anthropic_streaming_client(AnthropicProvider(status=401), mirror=mirror)
+        with pytest.raises(anthropic.AuthenticationError):
+            anthropic_create(client)
+        client.flush()
+        assert server.types() == ([] if mirror else ["ai.request"])
+
+    def test_with_block_closes_and_records_on_break(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider)
+        with anthropic_create(client) as stream:
+            assert stream.response.status_code == 200
+            read_until_hello_event(stream)
+            assert not provider.body.closed
+        assert provider.body.closed
+        client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 0}
+
+    def test_error_mid_stream_closes_records_and_raises(self):
+        provider = AnthropicProvider(fail=True)
+        client, server = anthropic_streaming_client(provider)
+        stream = anthropic_create(client)
+        with pytest.raises(Exception):
+            for _ in stream:
+                pass
+        assert provider.body.closed
+        client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    def test_mirror_mode(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider, mirror=True)
+        with anthropic_create(client, system="SYS") as stream:
+            assert [e.type for e in stream] == ANTHROPIC_EVENT_TYPES
+        client.flush()
+        assert provider.requests[0]["system"] == "SYS"
+        assert server.types() == ["ai.request", "ai.response"]
+        request, response = server.bodies
+        assert request["payload"]["monitor_mode"] is True
+        assert response["payload"]["monitor_mode"] is True
+        assert response["payload"]["output"] == "Hello"
+
+    def test_preflight_unavailable_records_the_request_and_the_response(self):
+        provider = AnthropicProvider()
+        client, server = anthropic_streaming_client(provider, preflight=UNAVAILABLE)
+        with pytest.warns(SignalVaultWarning):
+            stream = anthropic_create(client)
+        with stream:
+            assert [e.type for e in stream] == ANTHROPIC_EVENT_TYPES
+        client.flush()
+        assert server.types() == STREAM_EVENTS["preflight_unavailable"]
+        assert server.bodies[1]["payload"]["preflight_unavailable"] is True
+        assert server.bodies[2]["payload"]["output"] == "Hello"
+
+    @pytest.mark.parametrize("mode", list(STREAM_EVENTS))
+    def test_unread_stream_is_closed_and_recorded_when_collected(self, mode):
+        provider = AnthropicProvider()
+        client, server = stream_mode_client(anthropic_streaming_client, provider, mode)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SignalVaultWarning)
+            stream = anthropic_create(client)
+        assert len(provider.requests) == 1
+        del stream
+        client.flush()
+        assert provider.body.closed
+        assert server.types() == STREAM_EVENTS[mode]
+
+    @pytest.mark.asyncio
+    async def test_async_stream(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider)
+        stream = await anthropic_create(client)
+        assert isinstance(stream, signalvault.AsyncSignalVaultStream)
+        assert len(provider.requests) == 1
+        async with stream:
+            assert [e.type async for e in stream] == ANTHROPIC_EVENT_TYPES
+        assert provider.body.closed
+        await client.flush()
+        [response] = responses(server)
+        assert response["output"] == "Hello"
+        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+
+    @pytest.mark.asyncio
+    async def test_async_with_block_closes_and_records_on_break(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider)
+        async with await anthropic_create(client) as stream:
+            async for event in stream:
+                if event.type == "content_block_delta":
+                    break
+            assert not provider.body.closed
+        assert provider.body.closed
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mirror", [False, True])
+    async def test_async_provider_error_at_create_records_no_response(self, mirror):
+        import anthropic
+
+        client, server = async_anthropic_streaming_client(AnthropicProvider(status=401), mirror=mirror)
+        with pytest.raises(anthropic.AuthenticationError):
+            await anthropic_create(client)
+        await client.flush()
+        assert server.types() == ([] if mirror else ["ai.request"])
+
+    @pytest.mark.asyncio
+    async def test_async_mirror_mode(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider, mirror=True)
+        async with await anthropic_create(client) as stream:
+            assert [e.type async for e in stream] == ANTHROPIC_EVENT_TYPES
+        await client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+        assert server.bodies[0]["payload"]["monitor_mode"] is True
+        assert server.bodies[1]["payload"]["output"] == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_async_preflight_unavailable_records_the_request_and_the_response(self):
+        provider = AnthropicProvider()
+        client, server = async_anthropic_streaming_client(provider, preflight=UNAVAILABLE)
+        with pytest.warns(SignalVaultWarning):
+            stream = await anthropic_create(client)
+        async with stream:
+            assert [e.type async for e in stream] == ANTHROPIC_EVENT_TYPES
+        await client.flush()
+        assert server.types() == STREAM_EVENTS["preflight_unavailable"]
+        assert server.bodies[1]["payload"]["preflight_unavailable"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("mode", list(STREAM_EVENTS))
+    async def test_async_unread_stream_is_closed_and_recorded_when_collected(self, mode):
+        provider = AnthropicProvider()
+        client, server = stream_mode_client(async_anthropic_streaming_client, provider, mode)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SignalVaultWarning)
+            stream = await anthropic_create(client)
+        assert len(provider.requests) == 1
+        del stream
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await client.flush()
+        assert provider.body.closed
+        assert server.types() == STREAM_EVENTS[mode]
+
+    # See test_async_stream_left_open_is_recorded_when_the_loop_shuts_down.
+    @pytest.mark.filterwarnings("ignore::ResourceWarning")
+    @pytest.mark.parametrize("mode", list(STREAM_EVENTS))
+    def test_async_unread_stream_is_recorded_when_the_loop_shuts_down(self, mode):
+        provider = AnthropicProvider()
+        kept = []
+
+        async def main():
+            client, server = stream_mode_client(async_anthropic_streaming_client, provider, mode)
+            server.delay = 0.05  # the send takes time, as over a network
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SignalVaultWarning)
+                kept.append((await anthropic_create(client), server))
+
+        asyncio.run(main())
+        _, server = kept[0]
+        assert provider.body.closed
+        assert server.types() == STREAM_EVENTS[mode]

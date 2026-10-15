@@ -270,8 +270,8 @@ class TestStreaming:
         assert args[3] == 10
         assert args[4] == 5
 
-    def test_streaming_finally_sends_on_break(self):
-        """Breaking out of stream loop early still fires the response event."""
+    def test_streaming_with_block_sends_on_break(self):
+        """Breaking out of the loop inside `with` fires the response event on exit."""
         client = SignalVaultClient(api_key="sk_test", openai_api_key="sk-fake")
 
         chunks = [
@@ -282,14 +282,14 @@ class TestStreaming:
         with patch.object(client, "_send_request", return_value=Decision()), \
              patch.object(client._openai.chat.completions, "create", return_value=iter(chunks)), \
              patch.object(client, "_fire_response") as mock_fire:
-            gen = client.chat.completions.create(
+            with client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": "hi"}],
                 stream=True,
-            )
-            for _ in gen:
-                break  # early exit
-            gen.close()  # explicitly close to trigger finally block
+            ) as stream:
+                for _ in stream:
+                    break  # early exit
+                mock_fire.assert_not_called()
 
         mock_fire.assert_called_once()
         args = mock_fire.call_args[0]
