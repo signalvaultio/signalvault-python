@@ -1388,12 +1388,15 @@ class _AsyncStreamFinisher:
 async def _async_events(upstream: Any, collector: _StreamCollector, finish: _AsyncStreamFinisher) -> Any:
     """Drives an async provider stream for AsyncSignalVaultStream.
 
-    Python finalizes an async generator that is dropped half-read, on garbage
-    collection or when ``asyncio.run`` shuts down its loop, so the ``finally``
-    closes the provider stream and records the response even if the caller
-    stops reading without closing.
+    Python finalizes an async generator that has started and is then dropped,
+    on garbage collection or when ``asyncio.run`` shuts down its loop, so the
+    ``finally`` closes the provider stream and records the response even if
+    the caller stops reading without closing. The request has already been
+    sent, so ``AsyncSignalVaultStream._start()`` starts the generator before
+    the caller gets the stream: a stream that is never read is recorded too.
     """
     try:
+        yield None  # consumed by _start()
         async for item in upstream:
             if collector.add(item):
                 yield item
@@ -1424,10 +1427,14 @@ class AsyncSignalVaultStream:
     async def __anext__(self) -> Any:
         return await self._events.__anext__()
 
+    async def _start(self) -> "AsyncSignalVaultStream":
+        await self._events.__anext__()
+        return self
+
     async def close(self) -> None:
         """Closes the provider stream and records the response. Safe to call twice."""
-        await self._events.aclose()  # runs the generator's finally if it started
-        await self._finish()  # otherwise close and record here
+        await self._events.aclose()  # runs the generator's finally
+        await self._finish()  # in case aclose() raised before it ran
 
     async def aclose(self) -> None:
         """Same as :meth:`close`, as on the provider SDK's ``AsyncStream`` and on async generators."""
@@ -1620,7 +1627,7 @@ class _AsyncChatCompletions:
         response = await self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(
+            return await self._wrap_stream(
                 request_id, kwargs, response, metadata, mirror=False, fallback=fallback,
                 hide_usage_chunk=hide_usage_chunk,
             )
@@ -1642,7 +1649,7 @@ class _AsyncChatCompletions:
         response = await self._sv._openai.chat.completions.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(
+            return await self._wrap_stream(
                 request_id, kwargs, response, metadata, mirror=True, hide_usage_chunk=hide_usage_chunk,
             )
 
@@ -1657,7 +1664,7 @@ class _AsyncChatCompletions:
         )
         return response
 
-    def _wrap_stream(
+    async def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None, hide_usage_chunk: bool = False,
     ) -> AsyncSignalVaultStream:
@@ -1675,7 +1682,7 @@ class _AsyncChatCompletions:
                 )
             )
 
-        return AsyncSignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)
+        return await AsyncSignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)._start()
 
 
 class _AsyncChat:
@@ -1919,7 +1926,7 @@ class _AsyncAnthropicMessages:
         response = await self._sv._anthropic.messages.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
+            return await self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
 
         self._sv._spawn(
             self._sv._send_response_from_parts(
@@ -1936,7 +1943,7 @@ class _AsyncAnthropicMessages:
         response = await self._sv._anthropic.messages.create(**kwargs)
 
         if stream:
-            return self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
+            return await self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
 
         self._sv._spawn(
             self._sv._send_audit_from_parts(
@@ -1949,7 +1956,7 @@ class _AsyncAnthropicMessages:
         )
         return response
 
-    def _wrap_stream(
+    async def _wrap_stream(
         self, request_id: str, kwargs: dict, stream: Any,
         metadata: dict, mirror: bool, fallback: Any = None,
     ) -> AsyncSignalVaultStream:
@@ -1967,7 +1974,7 @@ class _AsyncAnthropicMessages:
                 )
             )
 
-        return AsyncSignalVaultStream(stream, _AnthropicEventCollector(), record)
+        return await AsyncSignalVaultStream(stream, _AnthropicEventCollector(), record)._start()
 
 
 class AsyncAnthropicSignalVaultClient(_BaseAsyncClient):
@@ -1995,14 +2002,16 @@ class AsyncAnthropicSignalVaultClient(_BaseAsyncClient):
         )
 
         # Streaming
-        async for event in await client.messages.create(
+        stream = await client.messages.create(
             model="claude-3-5-sonnet-20241022",
             messages=[{"role": "user", "content": "Count to 3"}],
             max_tokens=1024,
             stream=True,
-        ):
-            if event.type == "content_block_delta":
-                print(event.delta.text or "", end="", flush=True)
+        )
+        async with stream:
+            async for event in stream:
+                if event.type == "content_block_delta" and event.delta.type == "text_delta":
+                    print(event.delta.text, end="", flush=True)
 
         # Context manager (recommended)
         async with AsyncAnthropicSignalVaultClient(...) as client:
