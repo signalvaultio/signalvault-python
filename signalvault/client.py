@@ -953,7 +953,7 @@ class _BaseAsyncClient(_ClientCommon):
     async def __aexit__(self, *args: Any) -> None:
         await self.aclose()
 
-    def _spawn(self, coro: Awaitable[Any]) -> None:
+    def _spawn(self, coro: Awaitable[Any]) -> "Optional[asyncio.Task[Any]]":
         """Runs ``coro`` in the background, keeping a reference until it finishes."""
         try:
             task = asyncio.get_running_loop().create_task(coro)  # type: ignore[arg-type]
@@ -964,9 +964,10 @@ class _BaseAsyncClient(_ClientCommon):
                 "[SignalVault] No running event loop: audit event dropped. "
                 "Use the async client from async code.",
             )
-            return
+            return None
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
+        return task
 
     def _task_done(self, task: "asyncio.Task[Any]") -> None:
         self._tasks.discard(task)
@@ -1362,11 +1363,17 @@ class _AsyncStreamFinisher:
     collected while its event generator is still being finalized.
     """
 
-    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
+    def __init__(
+        self, upstream: Any, collector: _StreamCollector,
+        record: Callable[[str, int, int], "Optional[asyncio.Task[Any]]"],
+    ):
         self._upstream = upstream
         self._collector = collector
         self._record = record
         self._done = False
+        # AsyncSignalVaultStream calls in progress. Zero when Python finalizes
+        # the stream: on garbage collection or when asyncio.run shuts down.
+        self.watched = 0
 
     async def __call__(self) -> None:
         # No await between the check and the set, so two tasks can't both pass it.
@@ -1382,7 +1389,11 @@ class _AsyncStreamFinisher:
         except Exception:
             pass  # a failed close must not hide how the stream itself ended
         finally:
-            self._record(*self._collector.result())
+            sent = self._record(*self._collector.result())
+            if sent is not None and not self.watched:
+                # asyncio.run closes the loop without waiting for background
+                # tasks, so wait here, as flush() would.
+                await asyncio.wait([sent], timeout=5.0)
 
 
 async def _async_events(upstream: Any, collector: _StreamCollector, finish: _AsyncStreamFinisher) -> Any:
@@ -1396,7 +1407,7 @@ async def _async_events(upstream: Any, collector: _StreamCollector, finish: _Asy
     the caller gets the stream: a stream that is never read is recorded too.
     """
     try:
-        yield None  # consumed by _start()
+        yield None  # consumed by AsyncSignalVaultStream._start()
         async for item in upstream:
             if collector.add(item):
                 yield item
@@ -1411,10 +1422,15 @@ class AsyncSignalVaultStream:
     (or ``await stream.close()``) when you may stop early.
     """
 
-    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
+    def __init__(
+        self, upstream: Any, collector: _StreamCollector,
+        record: Callable[[str, int, int], "Optional[asyncio.Task[Any]]"],
+    ):
         self._upstream = upstream
         self._finish = _AsyncStreamFinisher(upstream, collector, record)
         self._events = _async_events(upstream, collector, self._finish)
+        self._started = False
+        self._reading = 0
 
     @property
     def response(self) -> Any:
@@ -1425,16 +1441,33 @@ class AsyncSignalVaultStream:
         return self
 
     async def __anext__(self) -> Any:
-        return await self._events.__anext__()
+        if not self._started:
+            await self._start()
+        self._reading += 1
+        self._finish.watched += 1
+        try:
+            return await self._events.__anext__()
+        finally:
+            self._reading -= 1
+            self._finish.watched -= 1
 
     async def _start(self) -> "AsyncSignalVaultStream":
-        await self._events.__anext__()
+        if not self._started:
+            self._started = True
+            await self._events.__anext__()  # the generator's first, empty item
         return self
 
     async def close(self) -> None:
-        """Closes the provider stream and records the response. Safe to call twice."""
-        await self._events.aclose()  # runs the generator's finally
-        await self._finish()  # in case aclose() raised before it ran
+        """Closes the provider stream and records the response. Safe to call twice, and while another task reads."""
+        self._finish.watched += 1
+        try:
+            if not self._reading:
+                await self._events.aclose()  # runs the generator's finally
+            # The generator can't be closed while another task is reading it,
+            # so close the provider stream under it, which ends that read.
+            await self._finish()
+        finally:
+            self._finish.watched -= 1
 
     async def aclose(self) -> None:
         """Same as :meth:`close`, as on the provider SDK's ``AsyncStream`` and on async generators."""
@@ -1670,8 +1703,8 @@ class _AsyncChatCompletions:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, prompt_tokens: int, completion_tokens: int) -> None:
-            self._sv._spawn(
+        def record(output: str, prompt_tokens: int, completion_tokens: int) -> "Optional[asyncio.Task[Any]]":
+            return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, prompt_tokens, completion_tokens, metadata,
@@ -1962,8 +1995,8 @@ class _AsyncAnthropicMessages:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, input_tokens: int, output_tokens: int) -> None:
-            self._sv._spawn(
+        def record(output: str, input_tokens: int, output_tokens: int) -> "Optional[asyncio.Task[Any]]":
+            return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, input_tokens, output_tokens, metadata,

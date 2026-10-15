@@ -894,7 +894,7 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
 
     With ``fail`` it stops after the first event that carries "Hello" and then
     raises ``error`` (default: a dropped connection), or with ``hang`` it waits
-    there forever (async only).
+    there until it's closed and then raises like a dropped connection (async only).
     """
 
     def __init__(
@@ -909,6 +909,7 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         self.error = error
         self.hang = hang
         self.closed = False
+        self._closing: Optional[asyncio.Event] = None
 
     def _raise(self):
         raise self.error if self.error is not None else httpx.ReadError("connection lost")
@@ -922,7 +923,9 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         for part in self.parts:
             yield part
         if self.hang:
-            await asyncio.Event().wait()
+            self._closing = asyncio.Event()
+            await self._closing.wait()
+            self._raise()
         if self.fail:
             self._raise()
 
@@ -931,6 +934,8 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
 
     async def aclose(self):
         self.closed = True
+        if self._closing is not None:
+            self._closing.set()
 
 
 def provider_handler(body: TrackedBody):
@@ -1173,6 +1178,43 @@ class TestStreamLifecycle:
         assert server.types() == ["ai.request", "ai.response"]
 
     @pytest.mark.asyncio
+    async def test_async_stream_built_directly_yields_only_upstream_items(self):
+        from signalvault.client import _AnthropicEventCollector
+
+        class Upstream:
+            async def __aiter__(self):
+                yield MagicMock(type="message_stop")
+
+            async def close(self):
+                pass
+
+        recorded = []
+        stream = signalvault.AsyncSignalVaultStream(Upstream(), _AnthropicEventCollector(), lambda *r: recorded.append(r))
+        assert [e.type async for e in stream] == ["message_stop"]
+        assert recorded == [("", 0, 0)]
+
+    @pytest.mark.asyncio
+    async def test_async_close_while_another_task_reads(self):
+        body = TrackedBody(hang=True)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+
+        async def read():
+            async for _ in stream:
+                pass
+
+        reader = asyncio.ensure_future(read())
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert not reader.done()  # waiting on the provider
+        await stream.close()
+        assert body.closed
+        with pytest.raises(DROPPED):
+            await asyncio.wait_for(reader, timeout=1)  # the close ended the read
+        await client.flush()
+        assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
     async def test_async_close_twice_then_collected_records_once(self):
         body = TrackedBody()
         client, server = async_streaming_client(body)
@@ -1214,6 +1256,7 @@ class TestStreamLifecycle:
 
         async def main():
             client, server = async_streaming_client(body)
+            server.delay = 0.05  # the send takes time, as over a network
             stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content == "Hello":
@@ -1461,6 +1504,17 @@ class TestAnthropicStream:
         assert [r["output"] for r in responses(server)] == ["Hello"]
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mirror", [False, True])
+    async def test_async_provider_error_at_create_records_no_response(self, mirror):
+        import anthropic
+
+        client, server = async_anthropic_streaming_client(AnthropicProvider(status=401), mirror=mirror)
+        with pytest.raises(anthropic.AuthenticationError):
+            await anthropic_create(client)
+        await client.flush()
+        assert server.types() == ([] if mirror else ["ai.request"])
+
+    @pytest.mark.asyncio
     async def test_async_mirror_mode(self):
         provider = AnthropicProvider()
         client, server = async_anthropic_streaming_client(provider, mirror=True)
@@ -1508,6 +1562,7 @@ class TestAnthropicStream:
 
         async def main():
             client, server = stream_mode_client(async_anthropic_streaming_client, provider, mode)
+            server.delay = 0.05  # the send takes time, as over a network
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", SignalVaultWarning)
                 kept.append((await anthropic_create(client), server))

@@ -12,7 +12,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 ### Changed
 
 - OpenAI `create(..., stream=True)` returns a `SignalVaultStream` / `AsyncSignalVaultStream` instead of a generator / async generator (see Fixes). Iterating it, `close()` and `aclose()` work as before. Generator-only APIs (`send()`, `throw()`, `asend()`, `athrow()`) and `inspect.isgenerator()` / `inspect.isasyncgen()` checks no longer apply. (#15)
-- Anthropic `messages.create(..., stream=True)` now calls the Anthropic SDK's `messages.create(..., stream=True)` instead of `messages.stream()`, as the Node SDK does. It yields the raw stream events, exactly as the Anthropic SDK does. **Note:** the extra events that `messages.stream()` added in recent Anthropic SDK versions (`text`, `input_json`, `citation`, ...) are no longer yielded; read the text from `content_block_delta` events instead. The request is now sent when `create()` is called, so provider errors (for example an invalid Anthropic key) are raised there rather than on the first iteration, and no response is recorded for them (an empty response was recorded before), as for non-streaming calls. It returns a `SignalVaultStream` / `AsyncSignalVaultStream` like the OpenAI clients, so the note above on generator-only APIs applies here too. (#29)
+- Anthropic `messages.create(..., stream=True)` now calls the Anthropic SDK's `messages.create(..., stream=True)` instead of `messages.stream()`, as the Node SDK does. It yields the raw stream events, exactly as the Anthropic SDK does. **Note:** the extra events that `messages.stream()` added in recent Anthropic SDK versions (`text`, `input_json`, `citation`, ...) are no longer yielded; read the text from `content_block_delta` events instead. The request is now sent when `create()` is called, so provider errors (for example an invalid Anthropic key) are raised there rather than on the first iteration, and nothing more is recorded for them, as for non-streaming calls. Before, an empty response was recorded, plus the fallback request when the pre-flight check was unavailable. It returns a `SignalVaultStream` / `AsyncSignalVaultStream` like the OpenAI clients, so the note above on generator-only APIs applies here too. (#29)
 
 ### Fixes
 
@@ -22,6 +22,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Closing the stream, or leaving the `with` block, closes the connection to OpenAI and records the response right away. Previously the connection stayed open until garbage collection, and a stream left after `break` was only recorded then.
   - Each response is still recorded exactly once: when the stream ends, raises, or is closed.
   - An async stream that is dropped before it is read is now closed and recorded too, when it is garbage-collected or at the latest when `asyncio.run` finishes. Previously its response was never recorded and the connection was not closed.
+  - When an async stream left open is recorded as `asyncio.run` shuts down, the SDK waits up to 5 seconds for the event to be sent. Previously the loop could close first and the event was lost.
+  - `close()` can be called from another task while one is reading the stream, for example from a timeout. It closes the connection, which ends that read.
 
   Both classes are exported for type hints. (#15)
 - Anthropic streams get the same: `with` / `async with`, `close()`, `.response`, an immediate close and record on `close()` or at the end of the `with` block, and exactly one recorded response. (#29)
