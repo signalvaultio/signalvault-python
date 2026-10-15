@@ -1431,6 +1431,7 @@ class AsyncSignalVaultStream:
         self._events = _async_events(upstream, collector, self._finish)
         self._started = False
         self._reading = 0
+        self._closing = False
 
     @property
     def response(self) -> Any:
@@ -1458,13 +1459,19 @@ class AsyncSignalVaultStream:
         return self
 
     async def close(self) -> None:
-        """Closes the provider stream and records the response. Safe to call twice, and while another task reads."""
+        """Closes the provider stream and records the response.
+
+        Safe to call twice, also at the same time, and while another task
+        reads the stream: that read then raises the provider SDK's connection
+        error.
+        """
         self._finish.watched += 1
         try:
-            if not self._reading:
+            if not self._reading and not self._closing:
+                self._closing = True
                 await self._events.aclose()  # runs the generator's finally
-            # The generator can't be closed while another task is reading it,
-            # so close the provider stream under it, which ends that read.
+            # The generator can't be closed while another task is reading or
+            # closing it, so close the provider stream directly.
             await self._finish()
         finally:
             self._finish.watched -= 1

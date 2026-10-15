@@ -899,7 +899,7 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
 
     def __init__(
         self, fail: bool = False, error: Optional[BaseException] = None,
-        hang: bool = False, events: Optional[List[str]] = None,
+        hang: bool = False, events: Optional[List[str]] = None, close_delay: float = 0.0,
     ):
         events = openai_sse_events() if events is None else events
         if fail or hang:
@@ -910,6 +910,7 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         self.hang = hang
         self.closed = False
         self._closing: Optional[asyncio.Event] = None
+        self.close_delay = close_delay
 
     def _raise(self):
         raise self.error if self.error is not None else httpx.ReadError("connection lost")
@@ -933,6 +934,8 @@ class TrackedBody(httpx.SyncByteStream, httpx.AsyncByteStream):
         self.closed = True
 
     async def aclose(self):
+        if self.close_delay:
+            await asyncio.sleep(self.close_delay)
         self.closed = True
         if self._closing is not None:
             self._closing.set()
@@ -1213,6 +1216,31 @@ class TestStreamLifecycle:
             await asyncio.wait_for(reader, timeout=1)  # the close ended the read
         await client.flush()
         assert [r["output"] for r in responses(server)] == ["Hello"]
+
+    @pytest.mark.asyncio
+    async def test_async_overlapping_closes_record_once(self):
+        body = TrackedBody(close_delay=0.01)
+        client, server = async_streaming_client(body)
+        stream = await client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        await stream.__anext__()
+        await asyncio.gather(stream.close(), stream.close())
+        assert body.closed
+        await client.flush()
+        assert len(responses(server)) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_close_and_end_of_stream_do_not_wait_for_signalvault(self):
+        body = TrackedBody()
+        client, server = async_streaming_client(body)
+        server.replies["ai.request"] = [ALLOW, ALLOW]
+        streams = [await client.chat.completions.create(model="m", messages=MESSAGES, stream=True) for _ in range(2)]
+        server.delay = 1.0  # the audit sends are slow
+        start = time.monotonic()
+        await streams[0].close()
+        assert [c async for c in streams[1]]
+        assert time.monotonic() - start < 0.5
+        await client.flush()
+        assert len(responses(server)) == 2
 
     @pytest.mark.asyncio
     async def test_async_close_twice_then_collected_records_once(self):

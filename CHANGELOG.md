@@ -22,8 +22,8 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   - Closing the stream, or leaving the `with` block, closes the connection to OpenAI and records the response right away. Previously the connection stayed open until garbage collection, and a stream left after `break` was only recorded then.
   - Each response is still recorded exactly once: when the stream ends, raises, or is closed.
   - An async stream that is dropped before it is read is now closed and recorded too, when it is garbage-collected or at the latest when `asyncio.run` finishes. Previously its response was never recorded and the connection was not closed.
-  - When an async stream left open is recorded as `asyncio.run` shuts down, the SDK waits up to 5 seconds for the event to be sent. Previously the loop could close first and the event was lost.
-  - `close()` can be called from another task while one is reading the stream, for example from a timeout. It closes the connection, which ends that read.
+  - When an async stream that is left open and not being read is recorded as `asyncio.run` shuts down, the SDK waits up to 5 seconds for the event to be sent. Previously the loop could close first and the event was lost. To be sure all events are sent, close streams and call `await client.aclose()` before the loop ends.
+  - `close()` can be called from another task while one is reading the stream, for example from a timeout. It closes the connection, and that read raises a connection error (`httpx.ReadError`, or `httpx2.ReadError` from recent `anthropic` versions), so catch it in the reading task.
 
   Both classes are exported for type hints. (#15)
 - Anthropic streams get the same: `with` / `async with`, `close()`, `.response`, an immediate close and record on `close()` or at the end of the `with` block, and exactly one recorded response. (#29)
