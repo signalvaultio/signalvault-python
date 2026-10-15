@@ -1302,6 +1302,7 @@ class SignalVaultStream:
         self._collector = collector
         self._record = record
         self._closed = False
+        self._close_lock = threading.Lock()
 
     @property
     def response(self) -> Any:
@@ -1327,10 +1328,11 @@ class SignalVaultStream:
             raise
 
     def close(self) -> None:
-        """Closes the provider stream and records the response. Safe to call twice."""
-        if self._closed:
-            return
-        self._closed = True
+        """Closes the provider stream and records the response. Safe to call twice, from any thread."""
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
         try:
             close = getattr(self._upstream, "close", None)
             if callable(close):
@@ -1367,6 +1369,7 @@ class _AsyncStreamFinisher:
         self._done = False
 
     async def __call__(self) -> None:
+        # No await between the check and the set, so two tasks can't both pass it.
         if self._done:
             return
         self._done = True

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import warnings
 from typing import Dict, List, Optional
@@ -1004,6 +1005,40 @@ class TestStreamLifecycle:
         stream.close()
         stream.close()
         assert list(stream) == []
+        del stream
+        client.flush()
+        assert body.closed
+        assert len(responses(server)) == 1
+
+    def test_close_from_two_threads_records_once(self, monkeypatch):
+        body = TrackedBody()
+        client, server = streaming_client(body)
+        stream = client.chat.completions.create(model="m", messages=MESSAGES, stream=True)
+        read_until_hello(stream)
+
+        # Each close() that reads _closed as False waits for the other thread
+        # to read it too, so without the lock both see False and record.
+        state = {"closed": False}
+        both_read = threading.Barrier(2, timeout=0.5)
+
+        def get_closed(_):
+            closed = state["closed"]
+            if not closed:
+                try:
+                    both_read.wait()
+                except threading.BrokenBarrierError:
+                    pass  # the other thread is waiting for the lock
+            return closed
+
+        def set_closed(_, value):
+            state["closed"] = value
+
+        monkeypatch.setattr(signalvault.SignalVaultStream, "_closed", property(get_closed, set_closed), raising=False)
+        threads = [threading.Thread(target=stream.close) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
         del stream
         client.flush()
         assert body.closed
