@@ -275,6 +275,34 @@ def _anthropic_output_text(response: Any) -> str:
     )
 
 
+def _openai_usage(usage: Any) -> Dict[str, int]:
+    return {
+        "prompt_tokens": usage.prompt_tokens if usage else 0,
+        "completion_tokens": usage.completion_tokens if usage else 0,
+    }
+
+
+_ANTHROPIC_USAGE_KEYS = (
+    "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens",
+)
+
+
+def _anthropic_usage(*sources: Any) -> Dict[str, int]:
+    """Anthropic usage under Anthropic's own names, as the proxy records it.
+
+    The server adds the cache counts to ``input_tokens``; renamed to
+    ``prompt_tokens``, which for OpenAI already includes cached tokens, they
+    would be lost. Later sources override earlier ones, but only with a count.
+    """
+    usage = {"input_tokens": 0, "output_tokens": 0}
+    for source in sources:
+        for key in _ANTHROPIC_USAGE_KEYS:
+            n = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+            if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+                usage[key] = n
+    return usage
+
+
 def _dump_model(obj: Any) -> Any:
     """The fields a pydantic model was given (by the provider or the caller), under pydantic v1 or v2."""
     if hasattr(obj, "model_dump"):
@@ -487,11 +515,11 @@ class _ClientCommon:
 
     def _response_body(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict, monitor_mode: bool = False,
+        usage: Dict[str, int], metadata: dict, monitor_mode: bool = False,
     ) -> dict:
         payload: Dict[str, Any] = {
             "output": output,
-            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
+            "usage": usage,
         }
         if monitor_mode:
             payload["monitor_mode"] = True
@@ -677,19 +705,19 @@ class _BaseSyncClient(_ClientCommon):
 
     def _fire_response(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
+        usage: Dict[str, int], metadata: dict, fallback: Any = None,
     ) -> None:
         """Submit response event to background executor — does not block caller."""
         if fallback is _NO_AUDIT:
             return
         self._submit(
             self._send_response_from_parts,
-            request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback,
+            request_id, model, output, usage, metadata, fallback,
         )
 
     def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
+        usage: Dict[str, int], metadata: dict, fallback: Any = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
@@ -697,27 +725,27 @@ class _BaseSyncClient(_ClientCommon):
             # Must land first: the server rejects an ai.response whose ai.request it has not stored.
             self._post_background(fallback, event_id=False)
         self._post_background(self._response_body(
-            request_id, model, output, prompt_tokens, completion_tokens, metadata,
+            request_id, model, output, usage, metadata,
         ))
 
     def _fire_audit(
         self, request_id: str, model: str, messages: list, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        usage: Dict[str, int], metadata: dict,
     ) -> None:
         """Submit audit events to background executor — does not block caller."""
         self._submit(
             self._send_audit_from_parts,
-            request_id, model, messages, output, prompt_tokens, completion_tokens, metadata,
+            request_id, model, messages, output, usage, metadata,
         )
 
     def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        usage: Dict[str, int], metadata: dict,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
         self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
         self._post_background(self._response_body(
-            request_id, model, output, prompt_tokens, completion_tokens, metadata, monitor_mode=True,
+            request_id, model, output, usage, metadata, monitor_mode=True,
         ))
 
     # -- Agent tool-use capture ---------------------------------------------
@@ -1048,7 +1076,7 @@ class _BaseAsyncClient(_ClientCommon):
 
     async def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict, fallback: Any = None,
+        usage: Dict[str, int], metadata: dict, fallback: Any = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
@@ -1056,17 +1084,17 @@ class _BaseAsyncClient(_ClientCommon):
             # Must land first: the server rejects an ai.response whose ai.request it has not stored.
             await self._post_background(fallback, event_id=False)
         await self._post_background(self._response_body(
-            request_id, model, output, prompt_tokens, completion_tokens, metadata,
+            request_id, model, output, usage, metadata,
         ))
 
     async def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        prompt_tokens: int, completion_tokens: int, metadata: dict,
+        usage: Dict[str, int], metadata: dict,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
         await self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
         await self._post_background(self._response_body(
-            request_id, model, output, prompt_tokens, completion_tokens, metadata, monitor_mode=True,
+            request_id, model, output, usage, metadata, monitor_mode=True,
         ))
 
     # -- Agent tool-use capture ---------------------------------------------
@@ -1236,15 +1264,14 @@ class _StreamCollector:
 
     def __init__(self) -> None:
         self.parts: List[str] = []
-        self.prompt_tokens = 0
-        self.completion_tokens = 0
+        self.usage: Dict[str, int] = {}
 
     def add(self, item: Any) -> bool:
         """Records an item. Returns False to keep it from the caller."""
         raise NotImplementedError
 
-    def result(self) -> Tuple[str, int, int]:
-        return "".join(self.parts), self.prompt_tokens, self.completion_tokens
+    def result(self) -> Tuple[str, Dict[str, int]]:
+        return "".join(self.parts), self.usage
 
 
 class _ChunkCollector(_StreamCollector):
@@ -1253,6 +1280,7 @@ class _ChunkCollector(_StreamCollector):
     def __init__(self, hide_usage_chunk: bool):
         super().__init__()
         self._hide_usage_chunk = hide_usage_chunk
+        self.usage = _openai_usage(None)
 
     def add(self, chunk: Any) -> bool:
         """Records a chunk. Returns False for the usage-only chunk the caller didn't ask for."""
@@ -1260,8 +1288,10 @@ class _ChunkCollector(_StreamCollector):
         if delta and delta.content:
             self.parts.append(delta.content)
         if getattr(chunk, "usage", None):
-            self.prompt_tokens = chunk.usage.prompt_tokens or 0
-            self.completion_tokens = chunk.usage.completion_tokens or 0
+            self.usage = {
+                "prompt_tokens": chunk.usage.prompt_tokens or 0,
+                "completion_tokens": chunk.usage.completion_tokens or 0,
+            }
             if self._hide_usage_chunk and not chunk.choices:
                 return False
         return True
@@ -1270,20 +1300,25 @@ class _ChunkCollector(_StreamCollector):
 class _AnthropicEventCollector(_StreamCollector):
     """Anthropic message stream events. Every event reaches the caller."""
 
+    def __init__(self) -> None:
+        super().__init__()
+        self.usage = _anthropic_usage()
+
     def add(self, event: Any) -> bool:
         kind = getattr(event, "type", None)
         if kind == "content_block_delta":
             delta = getattr(event, "delta", None)
             if getattr(delta, "type", None) == "text_delta":
                 self.parts.append(getattr(delta, "text", "") or "")
+        # message_delta may repeat the input and cache counts; its values win.
         elif kind == "message_start":
             usage = getattr(getattr(event, "message", None), "usage", None)
             if usage:
-                self.prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+                self.usage = _anthropic_usage(self.usage, usage)
         elif kind == "message_delta":
             usage = getattr(event, "usage", None)
             if usage:
-                self.completion_tokens = getattr(usage, "output_tokens", 0) or 0
+                self.usage = _anthropic_usage(self.usage, usage)
         return True
 
 
@@ -1297,7 +1332,7 @@ class SignalVaultStream:
     garbage-collected.
     """
 
-    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, int, int], None]):
+    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, Dict[str, int]], None]):
         self._upstream = upstream
         self._iterator = iter(upstream)
         self._collector = collector
@@ -1365,7 +1400,7 @@ class _AsyncStreamFinisher:
 
     def __init__(
         self, upstream: Any, collector: _StreamCollector,
-        record: Callable[[str, int, int], "Optional[asyncio.Task[Any]]"],
+        record: Callable[[str, Dict[str, int]], "Optional[asyncio.Task[Any]]"],
     ):
         self._upstream = upstream
         self._collector = collector
@@ -1424,7 +1459,7 @@ class AsyncSignalVaultStream:
 
     def __init__(
         self, upstream: Any, collector: _StreamCollector,
-        record: Callable[[str, int, int], "Optional[asyncio.Task[Any]]"],
+        record: Callable[[str, Dict[str, int]], "Optional[asyncio.Task[Any]]"],
     ):
         self._upstream = upstream
         self._finish = _AsyncStreamFinisher(upstream, collector, record)
@@ -1524,8 +1559,7 @@ class _ChatCompletions:
         self._sv._fire_response(
             request_id, kwargs.get("model", ""),
             (response.choices[0].message.content or "") if response.choices else "",
-            response.usage.prompt_tokens if response.usage else 0,
-            response.usage.completion_tokens if response.usage else 0,
+            _openai_usage(response.usage),
             metadata, fallback=fallback,
         )
         return response
@@ -1543,8 +1577,7 @@ class _ChatCompletions:
         self._sv._fire_audit(
             request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
             (response.choices[0].message.content or "") if response.choices else "",
-            response.usage.prompt_tokens if response.usage else 0,
-            response.usage.completion_tokens if response.usage else 0,
+            _openai_usage(response.usage),
             metadata,
         )
         return response
@@ -1555,15 +1588,15 @@ class _ChatCompletions:
     ) -> SignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, prompt_tokens: int, completion_tokens: int) -> None:
+        def record(output: str, usage: Dict[str, int]) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
-                    output, prompt_tokens, completion_tokens, metadata,
+                    output, usage, metadata,
                 )
             else:
                 self._sv._fire_response(
-                    request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
+                    request_id, model, output, usage, metadata, fallback=fallback,
                 )
 
         return SignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)
@@ -1676,8 +1709,7 @@ class _AsyncChatCompletions:
             self._sv._send_response_from_parts(
                 request_id, kwargs.get("model", ""),
                 (response.choices[0].message.content or "") if response.choices else "",
-                response.usage.prompt_tokens if response.usage else 0,
-                response.usage.completion_tokens if response.usage else 0,
+                _openai_usage(response.usage),
                 metadata, fallback=fallback,
             )
         )
@@ -1697,8 +1729,7 @@ class _AsyncChatCompletions:
             self._sv._send_audit_from_parts(
                 request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
                 (response.choices[0].message.content or "") if response.choices else "",
-                response.usage.prompt_tokens if response.usage else 0,
-                response.usage.completion_tokens if response.usage else 0,
+                _openai_usage(response.usage),
                 metadata,
             )
         )
@@ -1710,15 +1741,15 @@ class _AsyncChatCompletions:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, prompt_tokens: int, completion_tokens: int) -> "Optional[asyncio.Task[Any]]":
+        def record(output: str, usage: Dict[str, int]) -> "Optional[asyncio.Task[Any]]":
             return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
-                    output, prompt_tokens, completion_tokens, metadata,
+                    output, usage, metadata,
                 )
                 if mirror else
                 self._sv._send_response_from_parts(
-                    request_id, model, output, prompt_tokens, completion_tokens, metadata, fallback=fallback,
+                    request_id, model, output, usage, metadata, fallback=fallback,
                 )
             )
 
@@ -1824,8 +1855,7 @@ class _AnthropicMessages:
         self._sv._fire_response(
             request_id, kwargs.get("model", ""),
             _anthropic_output_text(response),
-            response.usage.input_tokens if response.usage else 0,
-            response.usage.output_tokens if response.usage else 0,
+            _anthropic_usage(response.usage),
             metadata, fallback=fallback,
         )
         return response
@@ -1839,8 +1869,7 @@ class _AnthropicMessages:
         self._sv._fire_audit(
             request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
             _anthropic_output_text(response),
-            response.usage.input_tokens if response.usage else 0,
-            response.usage.output_tokens if response.usage else 0,
+            _anthropic_usage(response.usage),
             metadata,
         )
         return response
@@ -1851,15 +1880,15 @@ class _AnthropicMessages:
     ) -> SignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, input_tokens: int, output_tokens: int) -> None:
+        def record(output: str, usage: Dict[str, int]) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
-                    output, input_tokens, output_tokens, metadata,
+                    output, usage, metadata,
                 )
             else:
                 self._sv._fire_response(
-                    request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
+                    request_id, model, output, usage, metadata, fallback=fallback,
                 )
 
         return SignalVaultStream(stream, _AnthropicEventCollector(), record)
@@ -1972,8 +2001,7 @@ class _AsyncAnthropicMessages:
             self._sv._send_response_from_parts(
                 request_id, kwargs.get("model", ""),
                 _anthropic_output_text(response),
-                response.usage.input_tokens if response.usage else 0,
-                response.usage.output_tokens if response.usage else 0,
+                _anthropic_usage(response.usage),
                 metadata, fallback=fallback,
             )
         )
@@ -1989,8 +2017,7 @@ class _AsyncAnthropicMessages:
             self._sv._send_audit_from_parts(
                 request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
                 _anthropic_output_text(response),
-                response.usage.input_tokens if response.usage else 0,
-                response.usage.output_tokens if response.usage else 0,
+                _anthropic_usage(response.usage),
                 metadata,
             )
         )
@@ -2002,15 +2029,15 @@ class _AsyncAnthropicMessages:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, input_tokens: int, output_tokens: int) -> "Optional[asyncio.Task[Any]]":
+        def record(output: str, usage: Dict[str, int]) -> "Optional[asyncio.Task[Any]]":
             return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
-                    output, input_tokens, output_tokens, metadata,
+                    output, usage, metadata,
                 )
                 if mirror else
                 self._sv._send_response_from_parts(
-                    request_id, model, output, input_tokens, output_tokens, metadata, fallback=fallback,
+                    request_id, model, output, usage, metadata, fallback=fallback,
                 )
             )
 
