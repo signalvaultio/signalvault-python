@@ -265,10 +265,9 @@ class TestStreaming:
 
         mock_fire.assert_called_once()
         args = mock_fire.call_args[0]
-        # (request_id, model, output, prompt_tokens, completion_tokens, metadata)
+        # (request_id, model, output, usage, metadata)
         assert args[2] == "Hello world"
-        assert args[3] == 10
-        assert args[4] == 5
+        assert args[3] == {"prompt_tokens": 10, "completion_tokens": 5}
 
     def test_streaming_with_block_sends_on_break(self):
         """Breaking out of the loop inside `with` fires the response event on exit."""
@@ -353,9 +352,9 @@ class TestStreamUsageChunk:
 
     @staticmethod
     def _recorded(record, mirror):
-        """(output, prompt_tokens, completion_tokens); audit events also carry the messages."""
+        """(output, usage); audit events also carry the messages."""
         args = record.call_args[0]
-        return args[3:6] if mirror else args[2:5]
+        return args[3:5] if mirror else args[2:4]
 
     @pytest.mark.parametrize("mirror", [False, True])
     def test_injected_usage_chunk_is_consumed(self, mirror):
@@ -364,14 +363,14 @@ class TestStreamUsageChunk:
         assert len(yielded) == 4
         # The README loop, unguarded, works on every chunk the caller receives.
         assert "".join(c.choices[0].delta.content or "" for c in yielded) == "Hello world"
-        assert recorded == ("Hello world", 10, 5)
+        assert recorded == ("Hello world", {"prompt_tokens": 10, "completion_tokens": 5})
 
     @pytest.mark.parametrize("mirror", [False, True])
     async def test_async_injected_usage_chunk_is_consumed(self, mirror):
         yielded, sent, recorded = await self._astream(self._chunks(), mirror=mirror)
         assert sent["stream_options"] == {"include_usage": True}
         assert len(yielded) == 4
-        assert recorded == ("Hello world", 10, 5)
+        assert recorded == ("Hello world", {"prompt_tokens": 10, "completion_tokens": 5})
 
     @pytest.mark.parametrize("mirror", [False, True])
     def test_caller_requested_usage_chunk_is_passed_through(self, mirror):
@@ -380,7 +379,7 @@ class TestStreamUsageChunk:
         )
         assert len(yielded) == 5
         assert yielded[-1].choices == [] and yielded[-1].usage.prompt_tokens == 10
-        assert recorded == ("Hello world", 10, 5)
+        assert recorded == ("Hello world", {"prompt_tokens": 10, "completion_tokens": 5})
 
     @pytest.mark.parametrize("mirror", [False, True])
     async def test_async_caller_requested_usage_chunk_is_passed_through(self, mirror):
@@ -389,7 +388,7 @@ class TestStreamUsageChunk:
         )
         assert len(yielded) == 5
         assert yielded[-1].choices == []
-        assert recorded == ("Hello world", 10, 5)
+        assert recorded == ("Hello world", {"prompt_tokens": 10, "completion_tokens": 5})
 
     def test_other_stream_options_still_get_usage(self):
         yielded, sent, recorded = self._stream(
@@ -397,7 +396,7 @@ class TestStreamUsageChunk:
         )
         assert sent["stream_options"] == {"include_obfuscation": False, "include_usage": True}
         assert len(yielded) == 4
-        assert recorded == ("Hello world", 10, 5)
+        assert recorded == ("Hello world", {"prompt_tokens": 10, "completion_tokens": 5})
 
     def test_usage_on_a_content_chunk_is_recorded(self):
         from openai.types import CompletionUsage
@@ -406,7 +405,7 @@ class TestStreamUsageChunk:
         chunks[-1].usage = CompletionUsage(prompt_tokens=7, completion_tokens=2, total_tokens=9)
         yielded, _, recorded = self._stream(chunks)
         assert len(yielded) == 3
-        assert recorded == ("Hello world", 7, 2)
+        assert recorded == ("Hello world", {"prompt_tokens": 7, "completion_tokens": 2})
 
     @pytest.mark.parametrize("given, sent, injected", [
         (_ABSENT, {"include_usage": True}, True),
@@ -451,7 +450,7 @@ class TestMirrorMode:
         with patch.object(client._http, "post", side_effect=mock_post):
             client._send_audit_from_parts(
                 "req-1", "gpt-4", [{"role": "user", "content": "hi"}],
-                "hello output", 5, 10, {}
+                "hello output", {"prompt_tokens": 5, "completion_tokens": 10}, {}
             )
 
         assert call_order == ["ai.request", "ai.response"]

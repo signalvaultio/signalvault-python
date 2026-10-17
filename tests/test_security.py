@@ -547,7 +547,7 @@ class TestBackgroundDelivery:
     def test_flush_waits_for_pending_events(self):
         server = Server(delay=0.1)
         client = sync_client(server)
-        client._fire_response("r", "m", "out", 1, 1, {})
+        client._fire_response("r", "m", "out", {"prompt_tokens": 1, "completion_tokens": 1}, {})
         assert server.requests == []
         client.flush()
         assert server.types() == ["ai.response"]
@@ -722,7 +722,7 @@ class TestRetryPolicy:
 
         client = SignalVaultClient(api_key="k", openai_api_key="x")
         client._http = httpx.Client(transport=httpx.MockTransport(handler))
-        client._fire_response("r", "m", "out", 1, 1, {})
+        client._fire_response("r", "m", "out", {"prompt_tokens": 1, "completion_tokens": 1}, {})
         client.flush()
         assert attempts == ["ai.response"]
 
@@ -1194,7 +1194,7 @@ class TestStreamLifecycle:
         recorded = []
         stream = signalvault.AsyncSignalVaultStream(Upstream(), _AnthropicEventCollector(), lambda *r: recorded.append(r))
         assert [e.type async for e in stream] == ["message_stop"]
-        assert recorded == [("", 0, 0)]
+        assert recorded == [("", {"input_tokens": 0, "output_tokens": 0})]
 
     @pytest.mark.asyncio
     async def test_async_close_while_another_task_reads(self):
@@ -1307,20 +1307,23 @@ ANTHROPIC_EVENT_TYPES = [
 ]
 
 
-def anthropic_sse_events() -> List[str]:
+def anthropic_sse_events(
+    start_usage: Optional[dict] = None, delta_usage: Optional[dict] = None,
+) -> List[str]:
     def event(data):
         return f"event: {data['type']}\ndata: {json.dumps(data)}\n\n"
 
     return [
         event({"type": "message_start", "message": {
             "id": "msg_1", "type": "message", "role": "assistant", "content": [], "model": "claude",
-            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 7, "output_tokens": 1},
+            "stop_reason": None, "stop_sequence": None,
+            "usage": start_usage or {"input_tokens": 7, "output_tokens": 1},
         }}),
         event({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
         event({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}}),
         event({"type": "content_block_stop", "index": 0}),
         event({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-               "usage": {"output_tokens": 2}}),
+               "usage": delta_usage or {"output_tokens": 2}}),
         event({"type": "message_stop"}),
     ]
 
@@ -1335,13 +1338,17 @@ def anthropic_httpx():
 class AnthropicProvider:
     """Answers like Anthropic's streaming Messages API and records the requests."""
 
-    def __init__(self, fail: bool = False, status: int = 200):
+    def __init__(
+        self, fail: bool = False, status: int = 200,
+        events: Optional[List[str]] = None, usage: Optional[dict] = None,
+    ):
         hx = anthropic_httpx()
         body_class = TrackedBody
         if hx is not httpx:  # httpx2 only accepts its own stream classes
             body_class = type("TrackedBody", (TrackedBody, hx.SyncByteStream, hx.AsyncByteStream), {})
-        self.body = body_class(fail=fail, events=anthropic_sse_events())
+        self.body = body_class(fail=fail, events=events or anthropic_sse_events())
         self.status = status
+        self.usage = usage  # of a non-streaming response
         self.requests: List[dict] = []
 
     def handler(self, request):
@@ -1350,6 +1357,13 @@ class AnthropicProvider:
         if self.status != 200:
             error = {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}}
             return hx.Response(self.status, json=error)
+        if not self.requests[-1].get("stream"):
+            return hx.Response(200, json={
+                "id": "msg_1", "type": "message", "role": "assistant", "model": "claude",
+                "content": [{"type": "text", "text": "Hello"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": self.usage or {"input_tokens": 7, "output_tokens": 2},
+            })
         return hx.Response(200, headers={"content-type": "text/event-stream"}, stream=self.body)
 
 
@@ -1421,7 +1435,7 @@ class TestAnthropicStream:
         client.flush()
         [response] = responses(server)
         assert response["output"] == "Hello"
-        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+        assert response["usage"] == {"input_tokens": 7, "output_tokens": 2}
 
     def test_request_is_sent_by_create_and_provider_errors_raise_there(self):
         import anthropic
@@ -1452,7 +1466,7 @@ class TestAnthropicStream:
         client.flush()
         [response] = responses(server)
         assert response["output"] == "Hello"
-        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 0}
+        assert response["usage"] == {"input_tokens": 7, "output_tokens": 1}
 
     def test_error_mid_stream_closes_records_and_raises(self):
         provider = AnthropicProvider(fail=True)
@@ -1516,7 +1530,7 @@ class TestAnthropicStream:
         await client.flush()
         [response] = responses(server)
         assert response["output"] == "Hello"
-        assert response["usage"] == {"prompt_tokens": 7, "completion_tokens": 2}
+        assert response["usage"] == {"input_tokens": 7, "output_tokens": 2}
 
     @pytest.mark.asyncio
     async def test_async_with_block_closes_and_records_on_break(self):
@@ -1599,3 +1613,85 @@ class TestAnthropicStream:
         _, server = kept[0]
         assert provider.body.closed
         assert server.types() == STREAM_EVENTS[mode]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic usage: the server reads it under Anthropic's names and adds the
+# cache counts to the input. Under OpenAI's prompt_tokens it would take the
+# count as already including them, so the SDK must not rename.
+# ---------------------------------------------------------------------------
+
+CACHED_USAGE = {
+    "input_tokens": 12,
+    "cache_creation_input_tokens": 2_000,
+    "cache_read_input_tokens": 90_000,
+    "output_tokens": 300,
+}
+
+
+class TestAnthropicUsage:
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_is_sent_under_anthropic_names_with_the_cache_counts(self, mirror):
+        client, server = anthropic_streaming_client(AnthropicProvider(usage=CACHED_USAGE), mirror=mirror)
+        client.messages.create(model="claude", max_tokens=10, messages=MESSAGES)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == CACHED_USAGE
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    async def test_async_is_sent_under_anthropic_names_with_the_cache_counts(self, mirror):
+        client, server = async_anthropic_streaming_client(AnthropicProvider(usage=CACHED_USAGE), mirror=mirror)
+        await client.messages.create(model="claude", max_tokens=10, messages=MESSAGES)
+        await client.flush()
+        [response] = responses(server)
+        assert response["usage"] == CACHED_USAGE
+
+    def test_cache_counts_that_are_null_are_left_out(self):
+        usage = {"input_tokens": 5, "cache_creation_input_tokens": None, "cache_read_input_tokens": 7, "output_tokens": 2}
+        client, server = anthropic_streaming_client(AnthropicProvider(usage=usage))
+        client.messages.create(model="claude", max_tokens=10, messages=MESSAGES)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {"input_tokens": 5, "cache_read_input_tokens": 7, "output_tokens": 2}
+
+    def test_values_that_are_not_counts_are_ignored(self):
+        from signalvault.client import _anthropic_usage
+
+        assert _anthropic_usage(MagicMock(input_tokens=5, output_tokens=2)) == {"input_tokens": 5, "output_tokens": 2}
+        assert _anthropic_usage({"input_tokens": -1, "cache_read_input_tokens": True, "output_tokens": "3"}) == {
+            "input_tokens": 0, "output_tokens": 0,
+        }
+        assert _anthropic_usage(None) == {"input_tokens": 0, "output_tokens": 0}
+
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_stream_keeps_message_start_counts_and_takes_output_from_message_delta(self, mirror):
+        events = anthropic_sse_events(
+            start_usage={**CACHED_USAGE, "output_tokens": 1}, delta_usage={"output_tokens": 300},
+        )
+        client, server = anthropic_streaming_client(AnthropicProvider(events=events), mirror=mirror)
+        with anthropic_create(client) as stream:
+            list(stream)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == CACHED_USAGE
+
+    async def test_stream_counts_in_message_delta_override_message_start(self):
+        events = anthropic_sse_events(
+            start_usage={"input_tokens": 1, "cache_read_input_tokens": 1, "output_tokens": 1},
+            delta_usage=CACHED_USAGE,
+        )
+        client, server = async_anthropic_streaming_client(AnthropicProvider(events=events))
+        async with await anthropic_create(client) as stream:
+            [e async for e in stream]
+        await client.flush()
+        [response] = responses(server)
+        assert response["usage"] == CACHED_USAGE
+
+    def test_stream_cut_short_records_the_message_start_counts(self):
+        events = anthropic_sse_events(start_usage={**CACHED_USAGE, "output_tokens": 1})
+        client, server = anthropic_streaming_client(AnthropicProvider(events=events))
+        with anthropic_create(client) as stream:
+            read_until_hello_event(stream)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {**CACHED_USAGE, "output_tokens": 1}
