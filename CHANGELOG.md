@@ -7,7 +7,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.6.0] — 2026-10-18
+
+Streams return closable stream objects (a breaking change, see Changed), and token counts for Anthropic prompt caching.
 
 ### Changed
 
