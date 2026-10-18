@@ -1654,6 +1654,49 @@ class TestAnthropicUsage:
         [response] = responses(server)
         assert response["usage"] == {"input_tokens": 5, "cache_read_input_tokens": 7, "output_tokens": 2}
 
+    # The server prices 1-hour cache writes from this breakdown.
+    @pytest.mark.parametrize("mirror", [False, True])
+    def test_includes_the_cache_creation_breakdown_without_anything_else_in_it(self, mirror):
+        usage = {
+            **CACHED_USAGE,
+            "cache_creation": {"ephemeral_5m_input_tokens": 500, "ephemeral_1h_input_tokens": 1_500, "other": 1},
+            "service_tier": "standard",
+        }
+        client, server = anthropic_streaming_client(AnthropicProvider(usage=usage), mirror=mirror)
+        client.messages.create(model="claude", max_tokens=10, messages=MESSAGES)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {
+            **CACHED_USAGE,
+            "cache_creation": {"ephemeral_5m_input_tokens": 500, "ephemeral_1h_input_tokens": 1_500},
+        }
+
+    def test_leaves_out_a_cache_creation_breakdown_with_no_counts(self):
+        usage = {**CACHED_USAGE, "cache_creation": {"ephemeral_5m_input_tokens": None}}
+        client, server = anthropic_streaming_client(AnthropicProvider(usage=usage))
+        client.messages.create(model="claude", max_tokens=10, messages=MESSAGES)
+        client.flush()
+        [response] = responses(server)
+        assert response["usage"] == CACHED_USAGE
+
+    async def test_stream_cache_creation_in_message_delta_overrides_message_start_count_by_count(self):
+        events = anthropic_sse_events(
+            start_usage={
+                **CACHED_USAGE, "output_tokens": 1,
+                "cache_creation": {"ephemeral_5m_input_tokens": 2_000, "ephemeral_1h_input_tokens": 0},
+            },
+            delta_usage={"output_tokens": 300, "cache_creation": {"ephemeral_1h_input_tokens": 5}},
+        )
+        client, server = async_anthropic_streaming_client(AnthropicProvider(events=events))
+        async with await anthropic_create(client) as stream:
+            [e async for e in stream]
+        await client.flush()
+        [response] = responses(server)
+        assert response["usage"] == {
+            **CACHED_USAGE,
+            "cache_creation": {"ephemeral_5m_input_tokens": 2_000, "ephemeral_1h_input_tokens": 5},
+        }
+
     def test_values_that_are_not_counts_are_ignored(self):
         from signalvault.client import _anthropic_usage
 

@@ -275,7 +275,7 @@ def _anthropic_output_text(response: Any) -> str:
     )
 
 
-def _openai_usage(usage: Any) -> Dict[str, int]:
+def _openai_usage(usage: Any) -> Dict[str, Any]:
     return {
         "prompt_tokens": usage.prompt_tokens if usage else 0,
         "completion_tokens": usage.completion_tokens if usage else 0,
@@ -286,20 +286,33 @@ _ANTHROPIC_USAGE_KEYS = (
     "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens", "output_tokens",
 )
 
+# ``usage.cache_creation``: the cache writes by cache lifetime, priced differently.
+_CACHE_CREATION_KEYS = ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
 
-def _anthropic_usage(*sources: Any) -> Dict[str, int]:
+
+def _copy_counts(target: Dict[str, Any], source: Any, keys: Tuple[str, ...]) -> Dict[str, Any]:
+    for key in keys:
+        n = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
+        if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
+            target[key] = n
+    return target
+
+
+def _anthropic_usage(*sources: Any) -> Dict[str, Any]:
     """Anthropic usage under Anthropic's own names, as the proxy records it.
 
     The server adds the cache counts to ``input_tokens``; renamed to
     ``prompt_tokens``, which for OpenAI already includes cached tokens, they
     would be lost. Later sources override earlier ones, but only with a count.
     """
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    usage: Dict[str, Any] = {"input_tokens": 0, "output_tokens": 0}
+    cache_creation: Dict[str, Any] = {}
     for source in sources:
-        for key in _ANTHROPIC_USAGE_KEYS:
-            n = source.get(key) if isinstance(source, dict) else getattr(source, key, None)
-            if isinstance(n, int) and not isinstance(n, bool) and n >= 0:
-                usage[key] = n
+        _copy_counts(usage, source, _ANTHROPIC_USAGE_KEYS)
+        breakdown = source.get("cache_creation") if isinstance(source, dict) else getattr(source, "cache_creation", None)
+        _copy_counts(cache_creation, breakdown, _CACHE_CREATION_KEYS)
+    if cache_creation:
+        usage["cache_creation"] = cache_creation
     return usage
 
 
@@ -515,7 +528,7 @@ class _ClientCommon:
 
     def _response_body(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, int], metadata: dict, monitor_mode: bool = False,
+        usage: Dict[str, Any], metadata: dict, monitor_mode: bool = False,
     ) -> dict:
         payload: Dict[str, Any] = {
             "output": output,
@@ -705,7 +718,7 @@ class _BaseSyncClient(_ClientCommon):
 
     def _fire_response(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, int], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
     ) -> None:
         """Submit response event to background executor — does not block caller."""
         if fallback is _NO_AUDIT:
@@ -717,7 +730,7 @@ class _BaseSyncClient(_ClientCommon):
 
     def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, int], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
@@ -730,7 +743,7 @@ class _BaseSyncClient(_ClientCommon):
 
     def _fire_audit(
         self, request_id: str, model: str, messages: list, output: str,
-        usage: Dict[str, int], metadata: dict,
+        usage: Dict[str, Any], metadata: dict,
     ) -> None:
         """Submit audit events to background executor — does not block caller."""
         self._submit(
@@ -740,7 +753,7 @@ class _BaseSyncClient(_ClientCommon):
 
     def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        usage: Dict[str, int], metadata: dict,
+        usage: Dict[str, Any], metadata: dict,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
         self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
@@ -1076,7 +1089,7 @@ class _BaseAsyncClient(_ClientCommon):
 
     async def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, int], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
@@ -1089,7 +1102,7 @@ class _BaseAsyncClient(_ClientCommon):
 
     async def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        usage: Dict[str, int], metadata: dict,
+        usage: Dict[str, Any], metadata: dict,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
         await self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
@@ -1264,13 +1277,13 @@ class _StreamCollector:
 
     def __init__(self) -> None:
         self.parts: List[str] = []
-        self.usage: Dict[str, int] = {}
+        self.usage: Dict[str, Any] = {}
 
     def add(self, item: Any) -> bool:
         """Records an item. Returns False to keep it from the caller."""
         raise NotImplementedError
 
-    def result(self) -> Tuple[str, Dict[str, int]]:
+    def result(self) -> Tuple[str, Dict[str, Any]]:
         return "".join(self.parts), self.usage
 
 
@@ -1332,7 +1345,7 @@ class SignalVaultStream:
     garbage-collected.
     """
 
-    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, Dict[str, int]], None]):
+    def __init__(self, upstream: Any, collector: _StreamCollector, record: Callable[[str, Dict[str, Any]], None]):
         self._upstream = upstream
         self._iterator = iter(upstream)
         self._collector = collector
@@ -1400,7 +1413,7 @@ class _AsyncStreamFinisher:
 
     def __init__(
         self, upstream: Any, collector: _StreamCollector,
-        record: Callable[[str, Dict[str, int]], "Optional[asyncio.Task[Any]]"],
+        record: Callable[[str, Dict[str, Any]], "Optional[asyncio.Task[Any]]"],
     ):
         self._upstream = upstream
         self._collector = collector
@@ -1459,7 +1472,7 @@ class AsyncSignalVaultStream:
 
     def __init__(
         self, upstream: Any, collector: _StreamCollector,
-        record: Callable[[str, Dict[str, int]], "Optional[asyncio.Task[Any]]"],
+        record: Callable[[str, Dict[str, Any]], "Optional[asyncio.Task[Any]]"],
     ):
         self._upstream = upstream
         self._finish = _AsyncStreamFinisher(upstream, collector, record)
@@ -1588,7 +1601,7 @@ class _ChatCompletions:
     ) -> SignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, usage: Dict[str, int]) -> None:
+        def record(output: str, usage: Dict[str, Any]) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
@@ -1741,7 +1754,7 @@ class _AsyncChatCompletions:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, usage: Dict[str, int]) -> "Optional[asyncio.Task[Any]]":
+        def record(output: str, usage: Dict[str, Any]) -> "Optional[asyncio.Task[Any]]":
             return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
@@ -1880,7 +1893,7 @@ class _AnthropicMessages:
     ) -> SignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, usage: Dict[str, int]) -> None:
+        def record(output: str, usage: Dict[str, Any]) -> None:
             if mirror:
                 self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
@@ -2029,7 +2042,7 @@ class _AsyncAnthropicMessages:
     ) -> AsyncSignalVaultStream:
         model = kwargs.get("model", "")
 
-        def record(output: str, usage: Dict[str, int]) -> "Optional[asyncio.Task[Any]]":
+        def record(output: str, usage: Dict[str, Any]) -> "Optional[asyncio.Task[Any]]":
             return self._sv._spawn(
                 self._sv._send_audit_from_parts(
                     request_id, model, self._sv._audit_messages(kwargs),
