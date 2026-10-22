@@ -334,8 +334,9 @@ class TestSyncErrorLogging:
             sync_client.flush()
         # Only once it has given up.
         assert [str(w.message).split(" (")[0] for w in record] == [
-            "[SignalVault] Audit event dropped after 6 attempts",
+            "[SignalVault] 1 audit event(s) dropped, every attempt failed",
         ]
+        assert sync_client.dropped_events.retries_exhausted == 1
         bodies = _post_json_calls(sync_client._http)
         assert len(bodies) == 6
         assert len({b["event_id"] for b in bodies}) == 1

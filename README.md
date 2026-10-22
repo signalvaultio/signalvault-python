@@ -259,27 +259,74 @@ Audit events (responses, mirror-mode events, tool calls) are queued in memory an
 
 - **Retries.** An event that fails with a connection error, a timeout, a 5xx or a 429 is retried with exponential backoff: up to 6 attempts over about two minutes (waits of about 4, 8, 16, 32 and 60 seconds). A 429's `Retry-After` is honoured, up to 60 seconds. Other 4xx responses mean the event was rejected, and it is not retried. Each event carries an `event_id`, so a retry is never double-counted. `tools.record()` makes the first attempt itself; if that one can be retried, the rest happen in the background.
 - **Queue.** Up to 1,000 events per client wait to be sent. When the queue is full, the oldest are dropped to make room.
-- **Drops.** Dropping is the last resort, and the SDK says so: a `SignalVaultWarning` whenever events are dropped (a full queue, all attempts used, or events still queued when the client is closed, the event loop stops or the process exits), at most once a minute per cause, with the number dropped so far.
 - **Order.** A call's request is sent before its response, retries included.
+- While `flush()`, `close()`, `aclose()` or the exit flush is waiting, retries wait at most a second, so queued events go out within the timeout you gave.
 
 The sync clients send from up to 4 background threads per client; the async clients send from tasks on the running event loop.
 
-## Shutting Down
+### Dropped events
 
-Background events are queued in memory. Wait for them before a short-lived process exits:
+Dropping is the last resort. An event is dropped only when:
+
+- every attempt failed (`retries_exhausted`),
+- the queue was full (`queue_full`),
+- it was still unsent when `close()` / `aclose()` or the exit flush reached its timeout, or when the async task sending it was cancelled, usually because the event loop stopped (`shutdown`),
+- or it could not be serialized to JSON (`unserializable`).
+
+Every drop is logged on the `signalvault` logger at `WARNING`, one record per occurrence, with the number of events, the cause and their ids:
+
+```
+SignalVault dropped 1 audit event(s), every attempt failed (6 attempts, last: rate limited, 429): event_id=4f6c...
+```
+
+A fallback `ai.request` (sent when the pre-flight check got no answer) has no `event_id`, so it is logged by its `request_id`, marked as such. The record also carries the cause and the ids as `record.signalvault_drop_cause` and `record.signalvault_dropped`. If your app doesn't configure `logging`, Python prints these records to stderr. The SDK also emits a `SignalVaultWarning`, at most once a minute per cause; the log has every drop.
+
+`client.dropped_events` counts what a client has dropped, by cause. It is a read-only snapshot, on sync and async clients:
 
 ```python
-client.close()          # sync: sends queued events (up to 5s), then closes the connection pool
-await client.aclose()   # async: same; required — pending async events are lost if the loop exits first
+dropped = client.dropped_events      # DroppedEvents(retries_exhausted=0, queue_full=0, shutdown=0, unserializable=0)
+dropped.retries_exhausted
+dropped.total
+```
 
-# Or only wait, keeping the client open:
-client.flush()
+## Shutting Down
+
+Background events are queued in memory, so wait for them before a process exits or is frozen.
+
+**Serverless and short-lived processes** (AWS Lambda, Cloud Functions, Cloud Run jobs, scripts, Celery tasks): call `flush()` at the end of each invocation, before you return. A function's process can be frozen as soon as the handler returns, and events still in the queue then are only sent if it is thawed again.
+
+```python
+def handler(event, context):
+    response = client.chat.completions.create(...)
+    client.flush()           # waits up to 5 seconds by default; flush(timeout=...) to change it
+    return response
+
+# async
 await async_client.flush()
 ```
 
-`close()`, `aclose()` and `flush()` take a `timeout` in seconds. Events still queued when `close()` or `aclose()` gives up are dropped, with a warning; `flush()` leaves them queued. An event waiting to be retried can take up to two minutes, so pass a longer `timeout` if you need every event through an outage.
+`flush()` keeps the client open, and events still unsent at its timeout stay queued (with a `SignalVaultWarning`).
 
-If a sync client is never closed, the SDK gives its queued events up to 3 seconds when the interpreter exits, retrying without waiting for the backoff, and never holds the process longer. Events still queued then are dropped, with a warning.
+When you are done with a client, close it:
+
+```python
+client.close()          # sync: sends queued events (up to 10 seconds), then closes the connection pool
+await client.aclose()   # async: same; required, since pending async events are lost if the loop ends first
+```
+
+`close()` and `aclose()` take a `timeout` in seconds (default 10). Nothing is dropped before it runs out. Events still unsent then can't be sent once the connection pool is closed, so they are dropped and logged with their ids. An event waiting to be retried can take up to two minutes through an outage, so pass a longer `timeout` if you need to wait that long.
+
+**Interpreter exit.** If a sync client is never closed, the SDK flushes it when the interpreter exits, for up to `exit_flush_timeout` seconds (default 10), and never holds the process longer. Events still unsent then are dropped and logged with their ids. Set it when you create the client; `0` sends nothing more at exit (the events left are still logged):
+
+```python
+client = SignalVaultClient(
+    api_key="sk_live_...",
+    openai_api_key=os.environ["OPENAI_API_KEY"],
+    exit_flush_timeout=10.0,  # seconds. Default: 10.0
+)
+```
+
+An async client can't send at exit, because its event loop has ended: `await client.aclose()` before the loop ends. Events an async client still holds at exit are logged as dropped.
 
 ## Error Handling
 
