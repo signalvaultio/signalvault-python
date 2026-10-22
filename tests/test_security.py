@@ -75,7 +75,35 @@ def sync_client(server: Server, **kw) -> SignalVaultClient:
     client._http = httpx.Client(transport=httpx.MockTransport(server.sync_handler))
     client._openai = MagicMock()
     client._openai.chat.completions.create.return_value = fake_completion()
+    record_waits(client)  # retries go out without waiting
     return client
+
+
+def async_client(server: Server, **kw) -> AsyncSignalVaultClient:
+    client = AsyncSignalVaultClient(api_key="sk_test_abc", openai_api_key="sk-fake", **kw)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(server.async_handler))
+    client._openai = MagicMock()
+
+    async def create(**_):
+        return fake_completion()
+
+    client._openai.chat.completions.create = create
+    record_waits(client)
+    return client
+
+
+def record_waits(client) -> List[float]:
+    """Replaces the waits between retries with a recorder, and fixes the jitter at its midpoint."""
+    waits: List[float] = []
+    client._random = lambda: 0.5
+    if isinstance(client, AsyncSignalVaultClient):
+        async def sleep(delay):
+            waits.append(delay)
+
+        client._sleep = sleep
+    else:
+        client._sleep = waits.append
+    return waits
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +543,7 @@ class TestUnserializableRequest:
 # ---------------------------------------------------------------------------
 
 class TestBackgroundDelivery:
-    def test_retries_once_on_503_with_same_event_id(self):
+    def test_retries_503_with_same_event_id(self):
         server = Server({"ai.request": [ALLOW], "ai.response": [{"status": 503}, {"status": 200}]})
         client = sync_client(server)
         client.chat.completions.create(model="m", messages=MESSAGES)
@@ -524,25 +552,6 @@ class TestBackgroundDelivery:
         responses = [b for b in server.bodies if b["type"] == "ai.response"]
         assert len(responses) == 2
         assert responses[0]["event_id"] == responses[1]["event_id"]
-
-    def test_short_retry_after_retried_long_one_dropped_with_warning(self):
-        server = Server({
-            "ai.request": [ALLOW, ALLOW],
-            "ai.response": [
-                {"status": 429, "headers": {"retry-after": "0"}},
-                {"status": 200},
-                {"status": 429, "headers": {"retry-after": "60"}},
-            ],
-        })
-        client = sync_client(server)
-        client.chat.completions.create(model="m", messages=MESSAGES)
-        client.flush()
-        assert server.types().count("ai.response") == 2
-
-        with pytest.warns(SignalVaultWarning, match="being dropped"):
-            client.chat.completions.create(model="m", messages=MESSAGES)
-            client.flush()
-        assert server.types().count("ai.response") == 3
 
     def test_flush_waits_for_pending_events(self):
         server = Server(delay=0.1)
@@ -592,7 +601,7 @@ class TestAsync:
         await client.chat.completions.create(model="m", messages=MESSAGES)
         assert len(client._tasks) == 1
         await client.flush()
-        assert client._tasks == set()
+        assert not client._tasks
         assert server.types() == ["ai.request", "ai.response"]
 
     def test_fire_without_loop_warns_instead_of_silently_dropping(self):
@@ -679,15 +688,16 @@ class TestToolCallWarnings:
             client.tools.record(tool_name="t", duration_ms=1)
         assert len([w for w in caught if issubclass(w.category, SignalVaultWarning)]) == 1
 
-    def test_failed_tool_call_warns_only_in_debug(self):
-        server = Server({"agent.tool_call": [{"status": 503}, {"status": 503}]})
+    @pytest.mark.parametrize("debug", [False, True])
+    def test_failed_tool_call_is_retried_without_a_warning(self, debug):
+        server = Server({"agent.tool_call": [{"status": 503}]})
+        client = sync_client(server, debug=debug)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            sync_client(server).tools.record(tool_name="t", duration_ms=1)
+            client.tools.record(tool_name="t", duration_ms=1)
+            client.flush()
         assert caught == []
-        with pytest.warns(SignalVaultWarning) as record:
-            sync_client(server, debug=True).tools.record(tool_name="t", duration_ms=1)
-        assert any("tool_call event failed: 503" in str(w.message) for w in record)
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
 
     @pytest.mark.asyncio
     async def test_async_rejected_tool_call_warns(self):
@@ -699,38 +709,251 @@ class TestToolCallWarnings:
 
 
 class TestRetryPolicy:
-    def test_warns_when_the_retry_is_rate_limited_too(self):
-        server = Server({
-            "ai.request": [ALLOW],
-            "ai.response": [
-                {"status": 429, "headers": {"retry-after": "0"}},
-                {"status": 429, "headers": {"retry-after": "60"}},
-            ],
-        })
+    def test_backs_off_exponentially_for_about_two_minutes(self):
+        server = Server({"agent.tool_call": [{"status": 503}] * 5})
         client = sync_client(server)
-        with pytest.warns(SignalVaultWarning, match="being dropped"):
+        waits = record_waits(client)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
+            client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+            client.flush()
+        assert waits == [4.0, 8.0, 16.0, 32.0, 60.0]
+        assert server.types() == ["agent.tool_call"] * 6
+        assert len({b["event_id"] for b in server.bodies}) == 1
+
+    def test_429_waits_as_long_as_retry_after_says_up_to_a_minute(self):
+        server = Server({"ai.request": [ALLOW], "ai.response": [
+            {"status": 429, "headers": {"retry-after": "0"}},
+            {"status": 429, "headers": {"retry-after": "30"}},
+            {"status": 429, "headers": {"retry-after": "600"}},
+            {"status": 429},
+        ]})
+        client = sync_client(server)
+        waits = record_waits(client)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
             client.chat.completions.create(model="m", messages=MESSAGES)
             client.flush()
-        assert server.types().count("ai.response") == 2
+        assert waits == [0.0, 30.0, 60.0, 32.0]  # no Retry-After on the 4th: the backoff
+        responses = [b for b in server.bodies if b["type"] == "ai.response"]
+        assert len(responses) == 5
+        assert len({r["event_id"] for r in responses}) == 1
 
-    def test_timeouts_are_not_retried(self):
+    def test_gives_up_after_six_attempts_with_a_warning(self):
+        server = Server({"ai.request": [ALLOW], "ai.response": [{"status": 429}] * 6})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match=r"dropped after 6 attempts \(rate limited, 429\)"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.flush()
+        assert server.types().count("ai.response") == 6
+
+    def test_timeouts_and_connection_errors_are_retried(self):
         attempts = []
 
         def handler(request):
-            attempts.append(json.loads(request.content)["type"])
-            raise httpx.ReadTimeout("slow", request=request)
+            attempts.append(json.loads(request.content)["event_id"])
+            if len(attempts) == 1:
+                raise httpx.ReadTimeout("slow", request=request)
+            if len(attempts) == 2:
+                raise httpx.ConnectError("down", request=request)
+            return httpx.Response(200, json={})
 
-        client = SignalVaultClient(api_key="k", openai_api_key="x")
+        client = sync_client(Server())
         client._http = httpx.Client(transport=httpx.MockTransport(handler))
         client._fire_response("r", "m", "out", {"prompt_tokens": 1, "completion_tokens": 1}, {})
         client.flush()
-        assert attempts == ["ai.response"]
+        assert len(attempts) == 3 and len(set(attempts)) == 1
 
-    def test_manual_tool_record_does_not_retry(self):
+    @pytest.mark.parametrize("status", [400, 401, 403, 413, 422])
+    def test_other_4xx_are_not_retried(self, status):
+        server = Server({"ai.request": [ALLOW], "ai.response": [{"status": status}]})
+        client = sync_client(server)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+
+    def test_fallback_request_is_retried_before_the_response(self):
+        server = Server({"ai.request": [{"status": 503}, {"status": 503}, {"status": 200}]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match="NOT applied"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert server.types() == ["ai.request", "ai.request", "ai.request", "ai.response"]
+        # No event_id: the server de-duplicates the fallback by request_id, retries included.
+        assert all("event_id" not in b for b in server.bodies[1:3])
+
+    def test_manual_tool_record_is_retried_in_the_background(self):
         server = Server({"agent.tool_call": [{"status": 503}, {"status": 200}]})
         client = sync_client(server)
         client.tools.record(tool_name="t", duration_ms=1)
-        assert server.types() == ["agent.tool_call"]
+        client.flush()
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
+        assert server.bodies[0]["event_id"] == server.bodies[1]["event_id"]
+
+    @pytest.mark.asyncio
+    async def test_async_backs_off_and_keeps_the_event_id(self):
+        server = Server({"ai.request": [ALLOW], "ai.response": [{"status": 503}, {"status": 429}]})
+        client = async_client(server)
+        waits = record_waits(client)
+        await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert waits == [4.0, 8.0]
+        responses = [b for b in server.bodies if b["type"] == "ai.response"]
+        assert len(responses) == 3 and len({r["event_id"] for r in responses}) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_manual_tool_record_is_retried_in_the_background(self):
+        server = Server({"agent.tool_call": [{"status": 502}]})
+        client = async_client(server)
+        await client.tools.record(tool_name="t", duration_ms=1)
+        await client.flush()
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
+
+    @pytest.mark.parametrize("header, expected", [
+        (None, 8.0), ("abc", 8.0), ("-1", 8.0), ("nan", 8.0),
+        ("Wed, 21 Oct 2026 07:28:00 GMT", 8.0), ("2.5", 2.5), ("inf", 60.0),
+    ])
+    def test_retry_delay(self, header, expected):
+        from signalvault.client import _retry_delay
+
+        headers = {"retry-after": header} if header is not None else {}
+        assert _retry_delay(httpx.Response(429, headers=headers), 2, lambda: 0.5) == expected
+        assert _retry_delay(None, 2, lambda: 0.5) == 8.0
+
+
+# ---------------------------------------------------------------------------
+# Delivery queue
+# ---------------------------------------------------------------------------
+
+class GatedServer(Server):
+    """Holds the first request until ``release()``, so later events wait in the queue."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+        self.first_arrived = threading.Event()
+
+    def sync_handler(self, request):
+        first = not self.requests
+        response = self._reply(request)
+        if first:
+            self.first_arrived.set()
+            self.gate.wait(5)
+        return response
+
+    def release(self):
+        self.gate.set()
+
+
+def tool_names(server: Server) -> List[str]:
+    return [b["payload"]["tool_name"] for b in server.bodies]
+
+
+class TestDeliveryQueue:
+    def _blocked_client(self, monkeypatch):
+        import signalvault.client as client_module
+
+        monkeypatch.setattr(client_module, "_MAX_QUEUED_EVENTS", 3)
+        monkeypatch.setattr(client_module, "_DELIVERY_WORKERS", 1)
+        server = GatedServer()
+        client = sync_client(server)
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t0"))
+        assert server.first_arrived.wait(5)  # t0 is being sent; the rest queue up
+        return client, server
+
+    def test_full_queue_drops_the_oldest_with_a_warning(self, monkeypatch):
+        client, server = self._blocked_client(monkeypatch)
+        with pytest.warns(SignalVaultWarning, match=r"queue full \(3 events waiting\).*1 dropped"):
+            for name in ("t1", "t2", "t3", "t4"):
+                client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
+        server.release()
+        client.flush()
+        assert tool_names(server) == ["t0", "t2", "t3", "t4"]
+
+    def test_close_drops_what_is_still_queued_with_a_warning(self, monkeypatch):
+        client, server = self._blocked_client(monkeypatch)
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t1"))
+        with pytest.warns(SignalVaultWarning, match="1 audit event.*dropped: the client was closed"):
+            client.close(timeout=0.05)
+        server.release()
+        assert tool_names(server) == ["t0"]
+
+    def test_counts_both_events_of_a_mirror_call(self, monkeypatch):
+        client, server = self._blocked_client(monkeypatch)
+        client._fire_audit("r1", "m", MESSAGES, "out", {}, {})  # 2 events
+        with pytest.warns(SignalVaultWarning, match="2 dropped"):
+            client._fire_audit("r2", "m", MESSAGES, "out", {}, {})
+        server.release()
+        client.flush()
+        assert [b.get("request_id") for b in server.bodies[1:]] == ["r2", "r2"]
+
+    @pytest.mark.asyncio
+    async def test_async_full_queue_drops_the_oldest_with_a_warning(self, monkeypatch):
+        import signalvault.client as client_module
+
+        monkeypatch.setattr(client_module, "_MAX_QUEUED_EVENTS", 3)
+        server = Server(delay=0.01)
+        client = async_client(server)
+        with pytest.warns(SignalVaultWarning, match=r"queue full.*1 dropped"):
+            for name in ("t1", "t2", "t3", "t4"):
+                client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
+        await client.flush()
+        assert sorted(tool_names(server)) == ["t2", "t3", "t4"]
+
+    @pytest.mark.asyncio
+    async def test_async_aclose_drops_what_is_left_with_a_warning(self):
+        server = Server(delay=1.0)
+        client = async_client(server)
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+        with pytest.warns(SignalVaultWarning, match="1 audit event.*dropped: the client was closed"):
+            await client.aclose(timeout=0.05)
+        assert not client._tasks
+
+
+class TestExitFlush:
+    def test_exit_sends_retries_without_waiting_for_the_backoff(self):
+        server = Server({"agent.tool_call": [{"status": 503}]})
+        client = sync_client(server)
+        client._sleep = client._wake.wait  # the real wait: about 4 seconds here
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+        start = time.monotonic()
+        while not server.requests and time.monotonic() - start < 5:
+            time.sleep(0.01)
+        client._hurry()
+        client._drain_before_exit(time.monotonic() + 2)
+        assert time.monotonic() - start < 2
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
+
+    def test_interpreter_exit_waits_a_few_seconds_at_most_then_warns(self, tmp_path):
+        import os
+        import subprocess
+        import sys
+
+        script = tmp_path / "exit_with_a_stuck_event.py"
+        script.write_text(
+            "import time, httpx, signalvault, signalvault.client as c\n"
+            "c._EXIT_FLUSH_SECONDS = 0.5\n"
+            "def handler(request):\n"
+            "    time.sleep(60)\n"
+            "    return httpx.Response(200)\n"
+            "client = signalvault.SignalVaultClient(api_key='k', openai_api_key='x')\n"
+            "client._http = httpx.Client(transport=httpx.MockTransport(handler))\n"
+            "client._fire_tool_call(signalvault.ToolRecordOptions(tool_name='t'))\n"
+            "print('exiting', flush=True)\n"
+        )
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = {**os.environ, "PYTHONPATH": repo}
+        start = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, str(script)], capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout == "exiting\n"
+        # Startup and imports take most of it; the event's send would take 60 seconds.
+        assert time.monotonic() - start < 15
+        assert "1 audit event(s) dropped: the process exited before they were sent" in proc.stderr
 
 
 class TestAuditWhenPreflightFailed:
@@ -745,10 +968,17 @@ class TestAuditWhenPreflightFailed:
         fallback = server.bodies[1]
         assert fallback["request_id"] == server.bodies[0]["request_id"]
         assert "event_id" not in fallback
-        assert fallback["payload"] == {"messages": MESSAGES, "preflight_unavailable": True}
+        assert fallback["payload"] == {"messages": MESSAGES, "fail_mode": "open", "preflight_unavailable": True}
 
-    def test_no_audit_events_after_a_refused_preflight(self):
-        server = Server({"ai.request": [{"status": 401, "json": {}}]})
+    @pytest.mark.parametrize("status,body", [
+        (401, {}),
+        # A 429 without "recorded": true: the trial limit, or the ingest ceiling.
+        (429, {"error": "rate_limited"}),
+        (429, {"error": {"type": "trial_limit_exceeded"}}),
+        (429, {"error": "rate_limited", "recorded": False}),
+    ])
+    def test_no_audit_events_after_a_refused_preflight(self, status, body):
+        server = Server({"ai.request": [{"status": status, "json": body}]})
         client = sync_client(server)
         with pytest.warns(SignalVaultWarning):
             client.chat.completions.create(model="m", messages=MESSAGES)
@@ -779,6 +1009,109 @@ class TestAuditWhenPreflightFailed:
         await client.flush()
         assert [c["type"] for c in calls] == ["ai.request", "ai.request", "ai.response"]
         assert calls[1]["payload"]["preflight_unavailable"] is True
+
+
+# Over the rule-check rate limit the server stores the ai.request without
+# running the rules, and says so.
+RECORDED_429 = {"status": 429, "headers": {"retry-after": "30"}, "json": {
+    "error": "rate_limited", "recorded": True, "event_id": "ev_1",
+    "decision": "unchecked", "reason": "pre_flight_rate_limited",
+}}
+
+
+class TestRuleCheckRateLimit:
+    def test_fail_open_warns_forwards_and_records_the_response(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning, match=r"rule checks are rate limited \(429\).*NOT applied.*still recorded"):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        client._openai.chat.completions.create.assert_called_once()
+        # No fallback ai.request: the server already has it.
+        assert server.types() == ["ai.request", "ai.response"]
+        assert server.bodies[1]["request_id"] == server.bodies[0]["request_id"]
+        assert server.bodies[1]["payload"]["output"] == "hello"
+
+    def test_fail_closed_raises_and_skips_the_provider(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = sync_client(server, fail_mode="closed")
+        with pytest.raises(SignalVaultUnavailableError, match="rule checks are rate limited") as exc:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert exc.value.status == 429
+        client._openai.chat.completions.create.assert_not_called()
+        assert server.types() == ["ai.request"]
+        assert server.bodies[0]["payload"]["fail_mode"] == "closed"
+
+    def test_tool_calls_are_recorded_too(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = sync_client(server)
+        with client.with_context(request_id="turn-1"), pytest.warns(SignalVaultWarning):
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.tool("lookup", lambda q: "ok")("x")
+        client.flush()
+        assert sorted(server.types()) == ["agent.tool_call", "ai.request", "ai.response"]
+
+    @pytest.mark.asyncio
+    async def test_async_fail_open_records_the_response(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = async_client(server)
+        with pytest.warns(SignalVaultWarning, match="still recorded"):
+            await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+
+    @pytest.mark.asyncio
+    async def test_async_fail_closed_raises(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = async_client(server, fail_mode="closed")
+        with pytest.raises(SignalVaultUnavailableError) as exc:
+            await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert exc.value.status == 429
+        assert server.types() == ["ai.request"]
+
+    def test_anthropic_records_the_response(self):
+        server = Server({"ai.request": [RECORDED_429]})
+        client = anthropic_client(server)
+        record_waits(client)
+        with pytest.warns(SignalVaultWarning, match="still recorded"):
+            client.messages.create(model="claude", max_tokens=5, messages=MESSAGES)
+        client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+
+    def test_warns_separately_from_a_plain_rate_limit(self):
+        server = Server({"ai.request": [{"status": 429, "json": {"error": "rate_limited"}}, RECORDED_429]})
+        client = sync_client(server)
+        with pytest.warns(SignalVaultWarning) as record:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        assert len(record) == 2
+
+
+class TestFailModeInPreflight:
+    @pytest.mark.parametrize("fail_mode", ["open", "closed"])
+    def test_preflight_says_what_happens_without_a_decision(self, fail_mode):
+        server = Server({"ai.request": [ALLOW]})
+        client = sync_client(server, fail_mode=fail_mode)
+        client.chat.completions.create(model="m", messages=MESSAGES)
+        assert server.bodies[0]["payload"] == {"messages": MESSAGES, "fail_mode": fail_mode}
+
+    @pytest.mark.asyncio
+    async def test_async_preflight(self):
+        server = Server({"ai.request": [ALLOW]})
+        client = async_client(server, fail_mode="closed")
+        await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert server.bodies[0]["payload"]["fail_mode"] == "closed"
+
+    def test_mirror_mode_request_has_none(self):
+        server = Server()
+        client = sync_client(server, mirror_mode=True, fail_mode="closed")
+        client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert server.types() == ["ai.request", "ai.response"]
+        assert "fail_mode" not in server.bodies[0]["payload"]
 
 
 class TestFailureClassification:
@@ -1410,11 +1743,13 @@ STREAM_EVENTS = {
     "normal": ["ai.request", "ai.response"],
     "mirror": ["ai.request", "ai.response"],
     "preflight_unavailable": ["ai.request", "ai.request", "ai.response"],
+    "preflight_rate_limited": ["ai.request", "ai.response"],
 }
+PREFLIGHT_REPLIES = {"preflight_unavailable": UNAVAILABLE, "preflight_rate_limited": RECORDED_429}
 
 
 def stream_mode_client(factory, provider: AnthropicProvider, mode: str):
-    return factory(provider, mirror=mode == "mirror", preflight=UNAVAILABLE if mode == "preflight_unavailable" else None)
+    return factory(provider, mirror=mode == "mirror", preflight=PREFLIGHT_REPLIES.get(mode))
 
 
 def read_until_hello_event(stream) -> None:

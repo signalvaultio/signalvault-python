@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import concurrent.futures
+import collections
 import dataclasses
 import datetime as _datetime
 import decimal
@@ -21,10 +21,10 @@ import time
 import traceback
 import uuid
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -45,14 +45,28 @@ from .tools import (
 
 DEFAULT_BASE_URL = "https://api.signalvault.io"
 _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
-# Longest Retry-After the SDK waits out before retrying a background event once.
-_MAX_RETRY_AFTER_SECONDS = 5.0
+# Background (audit) events: up to this many attempts each, about 4, 8, 16,
+# 32 and 60 seconds apart, so about two minutes in all.
+_MAX_ATTEMPTS = 6
+_BACKOFF_BASE_SECONDS = 4.0
+# Longest wait before a retry, also when a 429's Retry-After asks for more.
+_MAX_RETRY_DELAY_SECONDS = 60.0
+# Audit events waiting to be sent, per client. Above it the oldest are dropped.
+_MAX_QUEUED_EVENTS = 1_000
+# Threads sending audit events, per sync client.
+_DELIVERY_WORKERS = 4
+# An idle delivery thread waits this long for more events before it exits.
+_WORKER_IDLE_SECONDS = 1.0
+# How long interpreter exit waits for queued audit events.
+_EXIT_FLUSH_SECONDS = 3.0
 # A repeated warning is emitted at most once per this window.
 _WARN_INTERVAL_SECONDS = 60.0
 _DECISIONS = {"allow", "warn", "block", "redact"}
 _FAIL_MODES = {"open", "closed"}
 # Pre-flight failures where re-sending the ai.request later can succeed.
 _RECORDABLE_CAUSES = {"timeout", "network", "5xx", "invalid-response"}
+# Pre-flight failures where the server stored the ai.request without running the rules.
+_RECORDED_CAUSES = {"429-recorded"}
 # Passed as the fallback when no audit events should be sent at all.
 _NO_AUDIT: Any = object()
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -119,7 +133,8 @@ class Decision:
     dashboard_url: Optional[str] = None
     # Set when no decision was obtained: "record" if the server may not have
     # stored the request (network, timeout, 5xx, invalid response), "skip" if
-    # it refused it (401/402/403/429/3xx). Internal.
+    # it refused it (401/402/403/429/3xx), "recorded" if it stored it without
+    # running the rules (a 429 with "recorded": true). Internal.
     _preflight_failed: Optional[str] = field(default=None, repr=False, compare=False)
 
 
@@ -158,14 +173,6 @@ class SignalVaultUnavailableError(RuntimeError):
         )
         self.request_id = request_id
         self.status = status
-
-
-# ---------------------------------------------------------------------------
-# Module-level persistent background executor
-# ---------------------------------------------------------------------------
-
-_BACKGROUND_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="sv-audit")
-atexit.register(_BACKGROUND_EXECUTOR.shutdown, wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -372,19 +379,34 @@ def _encode_body(body: dict) -> bytes:
     ).encode("ascii")
 
 
-def _retry_delay(resp: Optional[httpx.Response]) -> Optional[float]:
-    """Seconds to wait before retrying a failed response once, or None for no retry."""
-    if resp is None:
-        return None
-    if resp.status_code == 429:
+def _retryable(resp: Optional[httpx.Response]) -> bool:
+    """Whether a later attempt can succeed: no response (connection error or timeout), 429 or 5xx."""
+    return resp is None or resp.status_code == 429 or resp.status_code >= 500
+
+
+def _retry_delay(resp: Optional[httpx.Response], attempt: int, rand: Callable[[], float]) -> float:
+    """Seconds to wait after failed attempt number ``attempt`` (from 1) before the next one.
+
+    A 429's Retry-After is honoured, up to a minute. Otherwise exponential
+    backoff with jitter: about 4, 8, 16, 32, then 60 seconds.
+    """
+    if resp is not None and resp.status_code == 429:
         try:
             retry_after = float(resp.headers.get("retry-after"))
         except (TypeError, ValueError):
-            return None
-        return retry_after if 0 <= retry_after <= _MAX_RETRY_AFTER_SECONDS else None
-    if resp.status_code >= 500:
-        return 0.25 + random.random() * 0.5
-    return None
+            retry_after = -1.0
+        if retry_after >= 0:  # False for NaN too
+            return min(retry_after, _MAX_RETRY_DELAY_SECONDS)
+    backoff = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1) * (0.8 + 0.4 * rand())
+    return min(backoff, _MAX_RETRY_DELAY_SECONDS)
+
+
+def _undelivered_cause(resp: Optional[httpx.Response]) -> str:
+    if resp is None:
+        return "SignalVault API unreachable or timed out"
+    if resp.status_code == 429:
+        return "rate limited, 429"
+    return f"SignalVault API error, {resp.status_code}"
 
 
 def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
@@ -404,6 +426,10 @@ def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
     if status == 403:
         return "403", f"SignalVault denied access (403: {error_type or 'forbidden'})"
     if status == 429:
+        if isinstance(body, dict) and body.get("recorded") is True:
+            # Over the rule-check rate limit: stored without a decision, so
+            # the audit events that follow are accepted.
+            return "429-recorded", "SignalVault rule checks are rate limited (429)"
         if error_type == "trial_limit_exceeded":
             return "429-trial", "SignalVault trial limit reached (429)"
         return "429", "SignalVault rate limit reached (429)"
@@ -423,6 +449,9 @@ class _ClientCommon:
         self._config = config
         self._last_warned: Dict[str, float] = {}
         self._warn_lock = threading.Lock()
+        self._dropped = 0  # audit events given up on, for the warnings
+        # Injectable for tests: jitter for the retry backoff.
+        self._random: Callable[[], float] = random.random
 
     def _headers(self) -> dict:
         return {
@@ -452,21 +481,26 @@ class _ClientCommon:
         """No decision could be obtained: raise in fail_mode 'closed', else warn and allow."""
         if self._config.fail_mode == "closed":
             raise SignalVaultUnavailableError(request_id, reason, status)
+        recorded = key in _RECORDED_CAUSES
         self._warn(
             f"preflight:{key}",
             f"[SignalVault] {reason}. Guardrails were NOT applied — requests are being sent "
-            f"to the provider unchecked (fail_mode='open').",
+            f"to the provider unchecked (fail_mode='open')."
+            + (" They are still recorded in the audit log." if recorded else ""),
         )
+        if recorded:
+            return Decision(_preflight_failed="recorded")
         return Decision(_preflight_failed="record" if key in _RECORDABLE_CAUSES else "skip")
 
     def _fallback_request(self, decision: Decision, request_id: str, params: dict, metadata: dict) -> Any:
         """What to send before the response when the pre-flight got no decision.
 
-        None: the pre-flight was recorded normally. ``_NO_AUDIT``: the server
-        refused it, so a response event would be refused too. Otherwise the
-        ai.request body, so an unchecked call still reaches the audit log.
+        None: the server stored the pre-flight, with a decision or (over the
+        rule-check rate limit) without one. ``_NO_AUDIT``: the server refused
+        it, so a response event would be refused too. Otherwise the ai.request
+        body, so an unchecked call still reaches the audit log.
         """
-        if decision._preflight_failed is None:
+        if decision._preflight_failed in (None, "recorded"):
             return None
         if decision._preflight_failed == "skip":
             return _NO_AUDIT
@@ -504,7 +538,10 @@ class _ClientCommon:
             "provider": self._provider,
             "model": params.get("model", ""),
             "metadata": metadata,
-            "payload": {"messages": self._audit_messages(params)},
+            # Tells the server whether a request it can't check is sent on
+            # ("open") or not ("closed"). Mirror mode never waits for a
+            # decision, so its ai.request has no fail_mode.
+            "payload": {"messages": self._audit_messages(params), "fail_mode": self._config.fail_mode},
         }
 
     def _interpret_preflight(self, request_id: str, resp: httpx.Response) -> Decision:
@@ -557,12 +594,37 @@ class _ClientCommon:
             "payload": {"messages": messages, "monitor_mode": True},
         }
 
-    def _log_undelivered(self, resp: Optional[httpx.Response]) -> None:
-        if resp is not None and resp.status_code == 429:
-            self._warn("bg-429", "[SignalVault] Rate limited (429): audit events are being dropped.")
+    def _log_undelivered(self, resp: Optional[httpx.Response], attempts: int) -> None:
+        """Reports the outcome of the last attempt: a drop always warns, a rejection only with debug."""
+        if resp is not None and 200 <= resp.status_code < 300:
+            return
+        if _retryable(resp):
+            self._drop(
+                "retries", 1,
+                f"[SignalVault] Audit event dropped after {attempts} attempt{'s' if attempts != 1 else ''} "
+                f"({_undelivered_cause(resp)}). {{total}} dropped by this client so far.",
+            )
         elif self._config.debug:
-            status = resp.status_code if resp is not None else "no response"
-            _emit_warning(f"[SignalVault] Event not delivered: {status}", SignalVaultWarning)
+            _emit_warning(f"[SignalVault] Event not delivered: {resp.status_code}", SignalVaultWarning)
+
+    def _drop(self, cause: str, count: int, message: str) -> None:
+        """Counts audit events that will never be sent, and warns at most once a minute per cause.
+
+        The last resort: events are retried and queued first. ``{total}`` in
+        ``message`` becomes the number this client has dropped so far.
+        """
+        with self._warn_lock:
+            self._dropped += count
+            total = self._dropped
+        self._warn(f"dropped:{cause}", message.format(total=total))
+
+    def _drop_overflow(self, count: int) -> None:
+        self._drop(
+            "overflow", count,
+            f"[SignalVault] Audit queue full ({_MAX_QUEUED_EVENTS:,} events waiting): the oldest "
+            f"events are being dropped. SignalVault is unreachable or rate limiting this app. "
+            f"{{total}} dropped by this client so far.",
+        )
 
     def _warn_tool_call_status(self, status_code: int) -> None:
         """4xx → warns regardless of debug; anything else non-2xx → only when debug=True."""
@@ -605,24 +667,48 @@ class _BaseSyncClient(_ClientCommon):
         self._init_common(config)
         # Never follow redirects: the API key must not be re-sent to another URL.
         self._http = httpx.Client(follow_redirects=False)
-        self._pending: set = set()
-        self._pending_lock = threading.Lock()
+        # Audit sends waiting for a delivery thread: (fn, args, number of events).
+        self._queue: Deque[Tuple[Callable[..., Any], tuple, int]] = collections.deque()
+        self._queue_cond = threading.Condition()
+        self._queued_events = 0
+        self._workers = 0  # delivery threads running
+        self._busy = 0  # sends in progress
+        self._busy_events = 0
+        self._closing = False
+        self._exiting = False
+        # Set on close() and at interpreter exit, to cut retry waits short.
+        self._wake = threading.Event()
+        # Injectable for tests: waits before a retry.
+        self._sleep: Callable[[float], Any] = self._wake.wait
+        _SYNC_CLIENTS.add(self)
 
     # -- Resource management -------------------------------------------------
 
     def flush(self, timeout: float = 5.0) -> None:
         """Waits up to ``timeout`` seconds for queued audit events to be sent."""
-        with self._pending_lock:
-            pending = list(self._pending)
-        if not pending:
-            return
-        _, not_done = concurrent.futures.wait(pending, timeout=timeout)
-        if not_done:
-            self._warn("flush-timeout", f"[SignalVault] flush() timed out with {len(not_done)} event(s) still sending.")
+        left = self._wait_idle(time.monotonic() + timeout)
+        if left:
+            self._warn("flush-timeout", f"[SignalVault] flush() timed out with {left} event(s) still sending.")
 
     def close(self, timeout: float = 5.0) -> None:
-        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool."""
-        self.flush(timeout)
+        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool.
+
+        Events still queued then are dropped, with a warning.
+        """
+        self._wait_idle(time.monotonic() + timeout)
+        with self._queue_cond:
+            self._closing = True
+            dropped = self._queued_events
+            self._queue.clear()
+            self._queued_events = 0
+            self._queue_cond.notify_all()
+        self._wake.set()
+        if dropped:
+            self._drop(
+                "closed", dropped,
+                f"[SignalVault] {dropped} audit event(s) dropped: the client was closed before "
+                f"they were sent. {{total}} dropped by this client so far.",
+            )
         self._http.close()
 
     def __enter__(self) -> "_BaseSyncClient":
@@ -631,19 +717,111 @@ class _BaseSyncClient(_ClientCommon):
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _submit(self, fn: Callable[..., Any], *args: Any) -> None:
-        future = _BACKGROUND_EXECUTOR.submit(fn, *args)
-        with self._pending_lock:
-            self._pending.add(future)
+    # -- Delivery queue ------------------------------------------------------
 
-        def _done(f: concurrent.futures.Future) -> None:
-            with self._pending_lock:
-                self._pending.discard(f)
-            if not f.cancelled() and f.exception() is not None and self._config.debug:
-                exc = f.exception()
-                traceback.print_exception(type(exc), exc, exc.__traceback__)
+    def _submit(self, fn: Callable[..., Any], *args: Any, events: int = 1) -> None:
+        """Queues ``fn(*args)``, which sends ``events`` audit events, for a delivery thread.
 
-        future.add_done_callback(_done)
+        When more than ``_MAX_QUEUED_EVENTS`` are waiting, the oldest are dropped.
+        """
+        with self._queue_cond:
+            closed = self._closing
+            dropped = 0
+            start = False
+            if not closed:
+                self._queue.append((fn, args, events))
+                self._queued_events += events
+                while self._queued_events > _MAX_QUEUED_EVENTS and len(self._queue) > 1:
+                    _, _, n = self._queue.popleft()
+                    self._queued_events -= n
+                    dropped += n
+                # One more thread if every running one is busy, up to _DELIVERY_WORKERS.
+                start = self._workers < _DELIVERY_WORKERS and self._workers - self._busy < len(self._queue)
+                if start:
+                    self._workers += 1
+                self._queue_cond.notify_all()  # flush() waits on it too
+        if closed:
+            self._drop(
+                "closed", events,
+                "[SignalVault] Audit event dropped: the client is closed. "
+                "{total} dropped by this client so far.",
+            )
+            return
+        if dropped:
+            self._drop_overflow(dropped)
+        if start:
+            self._start_worker()
+
+    def _start_worker(self) -> None:
+        try:
+            threading.Thread(target=self._work, name="sv-audit", daemon=True).start()
+        except RuntimeError:  # can't start threads: the interpreter is shutting down
+            with self._queue_cond:
+                self._workers -= 1
+                self._queue_cond.notify_all()
+
+    def _work(self) -> None:
+        """A delivery thread: sends queued events until none arrive for a while."""
+        while True:
+            with self._queue_cond:
+                if not self._queue and not self._closing:
+                    self._queue_cond.wait(_WORKER_IDLE_SECONDS)
+                if not self._queue or self._closing:
+                    self._workers -= 1
+                    self._queue_cond.notify_all()
+                    return
+                fn, args, events = self._queue.popleft()
+                self._queued_events -= events
+                self._busy += 1
+                self._busy_events += events
+            try:
+                fn(*args)
+            except Exception:
+                if self._config.debug:
+                    traceback.print_exc()
+            finally:
+                with self._queue_cond:
+                    self._busy -= 1
+                    self._busy_events -= events
+                    self._queue_cond.notify_all()
+
+    def _wait_idle(self, deadline: float) -> int:
+        """Waits until nothing is queued or sending, or until ``deadline``. Returns the events left."""
+        with self._queue_cond:
+            while self._queued_events or self._busy:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return self._queued_events + self._busy_events
+                self._queue_cond.wait(remaining)
+        return 0
+
+    def _pause(self, delay: float) -> bool:
+        """Waits before a retry; at interpreter exit, not at all. False once the client is closing."""
+        if not self._exiting:
+            self._sleep(delay)
+        return not self._closing
+
+    def _hurry(self) -> None:
+        """Interpreter exit: retries go out without waiting, while there is time."""
+        self._exiting = True
+        self._wake.set()
+
+    def _drain_before_exit(self, deadline: float) -> None:
+        if self._closing:
+            return
+        with self._queue_cond:
+            start = bool(self._queue) and self._workers == 0
+            if start:
+                self._workers += 1
+        if start:
+            self._start_worker()
+        left = self._wait_idle(deadline)
+        if left:
+            self._drop(
+                "exit", left,
+                f"[SignalVault] {left} audit event(s) dropped: the process exited before they "
+                f"were sent. Call client.close() before exiting to wait longer.",
+            )
 
     # -- Internal HTTP -------------------------------------------------------
 
@@ -655,48 +833,40 @@ class _BaseSyncClient(_ClientCommon):
             content=content,
         )
 
-    def _post_background(
-        self, body: dict, *, event_id: bool = True, retry: bool = True,
-    ) -> Optional[httpx.Response]:
-        """POST with one retry on connection errors, 5xx, and 429 with a short Retry-After.
-
-        ``event_id`` adds an idempotency key so a retry is never double-counted;
-        it is off only for the fallback ai.request, which relies on the
-        server's request_id de-duplication (the original pre-flight may have
-        been stored before the client gave up). Timeouts are not retried: the
-        server may be slow rather than down, and a retry would hold a worker
-        twice as long. Returns the last response, or None.
-        """
-        event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
-        content = self._encode_event(event)
-        if content is None:
-            return None
-        resp: Optional[httpx.Response] = None
-        delay: Optional[float] = None
+    def _attempt(self, content: bytes) -> Optional[httpx.Response]:
+        """One POST of a background event; None on a connection error or timeout."""
         try:
-            resp = self._post(content, self._config.timeout)
-            if 200 <= resp.status_code < 300:
-                return resp
-            delay = _retry_delay(resp)
-        except httpx.TimeoutException:
-            if self._config.debug:
-                traceback.print_exc()
+            return self._post(content, self._config.timeout)
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
-            delay = 0.25 + random.random() * 0.5
+            return None
 
-        if retry and delay is not None:
-            time.sleep(delay)
-            try:
-                resp = self._post(content, self._config.timeout)
-                if 200 <= resp.status_code < 300:
-                    return resp
-            except httpx.HTTPError:
-                if self._config.debug:
-                    traceback.print_exc()
+    def _post_background(
+        self, body: dict, *, event_id: bool = True, attempt: int = 1,
+    ) -> Optional[httpx.Response]:
+        """POST, retrying connection errors, timeouts, 429 and 5xx, up to ``_MAX_ATTEMPTS`` in all.
 
-        self._log_undelivered(resp)
+        Waits between attempts as ``_retry_delay`` says. ``event_id`` adds an
+        idempotency key (unless ``body`` has one) so a retry is never
+        double-counted; it is off only for the fallback ai.request, which
+        relies on the server's request_id de-duplication instead (the original
+        pre-flight may have been stored before the client gave up), and that
+        covers its retries too. ``attempt`` numbers the first attempt, for an
+        event already tried once. Returns the last response, or None.
+        """
+        event = {"event_id": str(uuid.uuid4()), **body} if event_id and "event_id" not in body else body
+        content = self._encode_event(event)
+        if content is None:
+            return None
+        while True:
+            resp = self._attempt(content)
+            if not _retryable(resp) or attempt >= _MAX_ATTEMPTS:  # delivered, rejected, or out of attempts
+                break
+            if not self._pause(_retry_delay(resp, attempt, self._random)):
+                break  # the client is closing
+            attempt += 1
+        self._log_undelivered(resp, attempt)
         return resp
 
     def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
@@ -720,12 +890,13 @@ class _BaseSyncClient(_ClientCommon):
         self, request_id: str, model: str, output: str,
         usage: Dict[str, Any], metadata: dict, fallback: Any = None,
     ) -> None:
-        """Submit response event to background executor — does not block caller."""
+        """Queues the response event (after the fallback ai.request, if any). Does not block the caller."""
         if fallback is _NO_AUDIT:
             return
         self._submit(
             self._send_response_from_parts,
             request_id, model, output, usage, metadata, fallback,
+            events=1 if fallback is None else 2,
         )
 
     def _send_response_from_parts(
@@ -745,10 +916,11 @@ class _BaseSyncClient(_ClientCommon):
         self, request_id: str, model: str, messages: list, output: str,
         usage: Dict[str, Any], metadata: dict,
     ) -> None:
-        """Submit audit events to background executor — does not block caller."""
+        """Queues the mirror-mode request and response events. Does not block the caller."""
         self._submit(
             self._send_audit_from_parts,
             request_id, model, messages, output, usage, metadata,
+            events=2,
         )
 
     def _send_audit_from_parts(
@@ -767,18 +939,27 @@ class _BaseSyncClient(_ClientCommon):
         """Blocking POST of an agent.tool_call event. Surfaces 4xx via warnings.
 
         Used by the manual API (``client.tools.record``) directly. Raises
-        ``ValueError`` on an invalid ``tool_name``.
+        ``ValueError`` on an invalid ``tool_name``. If the POST fails in a way
+        a retry can fix, the event is retried in the background.
         """
         body = build_tool_call_body(
             environment=self._config.environment,
             default_metadata=self._config.metadata,
             opts=opts,
         )
-        self._deliver_tool_call(body, retry=False)
+        event = {"event_id": str(uuid.uuid4()), **body}
+        content = self._encode_event(event)
+        if content is None:
+            return
+        resp = self._attempt(content)
+        if _retryable(resp):
+            self._submit(self._deliver_tool_call, event, 2)
+        else:
+            self._warn_tool_call_status(resp.status_code)
 
-    def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
-        resp = self._post_background(body, retry=retry)
-        if resp is not None and resp.status_code != 429:
+    def _deliver_tool_call(self, body: dict, attempt: int = 1) -> None:
+        resp = self._post_background(body, attempt=attempt)
+        if not _retryable(resp):
             self._warn_tool_call_status(resp.status_code)
 
     def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
@@ -866,6 +1047,28 @@ class _BaseSyncClient(_ClientCommon):
         if fn is None:
             return decorator
         return decorator(fn)
+
+
+# Sync clients whose queued audit events get a last chance at interpreter exit.
+_SYNC_CLIENTS: "weakref.WeakSet[_BaseSyncClient]" = weakref.WeakSet()
+
+
+def _flush_at_exit() -> None:
+    """Gives queued audit events ``_EXIT_FLUSH_SECONDS`` to be sent when the interpreter exits.
+
+    Retries go out without waiting for their backoff. Delivery threads are
+    daemon threads, so this never keeps the process alive past the deadline;
+    events still queued then are dropped, with a warning.
+    """
+    deadline = time.monotonic() + _EXIT_FLUSH_SECONDS
+    clients = list(_SYNC_CLIENTS)
+    for client in clients:
+        client._hurry()
+    for client in clients:
+        client._drain_before_exit(deadline)
+
+
+atexit.register(_flush_at_exit)
 
 
 class _SyncToolsAPI:
@@ -968,9 +1171,13 @@ class _BaseAsyncClient(_ClientCommon):
         self._init_common(config)
         # Never follow redirects: the API key must not be re-sent to another URL.
         self._http = httpx.AsyncClient(follow_redirects=False)
+        # Audit tasks, oldest first, with the number of events each sends.
         # Strong references: the event loop keeps only weak references to
         # tasks, so an unreferenced audit task can be garbage-collected mid-send.
-        self._tasks: set = set()
+        self._tasks: Dict["asyncio.Task[Any]", int] = {}
+        self._queued_events = 0
+        # Injectable for tests: waits before a retry.
+        self._sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
 
     # -- Resource management -------------------------------------------------
 
@@ -981,11 +1188,24 @@ class _BaseAsyncClient(_ClientCommon):
             return
         _, pending = await asyncio.wait(tasks, timeout=timeout)
         if pending:
-            self._warn("flush-timeout", f"[SignalVault] flush() timed out with {len(pending)} event(s) still sending.")
+            left = sum(self._tasks.get(t, 0) for t in pending)
+            self._warn("flush-timeout", f"[SignalVault] flush() timed out with {left} event(s) still sending.")
 
     async def aclose(self, timeout: float = 5.0) -> None:
-        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool."""
-        await self.flush(timeout)
+        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool.
+
+        Events still queued then are dropped, with a warning.
+        """
+        tasks = [t for t in self._tasks if not t.done()]
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            dropped = sum(self._cancel(t) for t in pending)
+            if dropped:
+                self._drop(
+                    "closed", dropped,
+                    f"[SignalVault] {dropped} audit event(s) dropped: the client was closed before "
+                    f"they were sent. {{total}} dropped by this client so far.",
+                )
         await self._http.aclose()
 
     async def __aenter__(self) -> "_BaseAsyncClient":
@@ -994,8 +1214,12 @@ class _BaseAsyncClient(_ClientCommon):
     async def __aexit__(self, *args: Any) -> None:
         await self.aclose()
 
-    def _spawn(self, coro: Awaitable[Any]) -> "Optional[asyncio.Task[Any]]":
-        """Runs ``coro`` in the background, keeping a reference until it finishes."""
+    def _spawn(self, coro: Awaitable[Any], events: int = 1) -> "Optional[asyncio.Task[Any]]":
+        """Runs ``coro``, which sends ``events`` audit events, in the background.
+
+        When more than ``_MAX_QUEUED_EVENTS`` are unsent, the oldest tasks are
+        cancelled and their events dropped.
+        """
         try:
             task = asyncio.get_running_loop().create_task(coro)  # type: ignore[arg-type]
         except RuntimeError:
@@ -1006,13 +1230,40 @@ class _BaseAsyncClient(_ClientCommon):
                 "Use the async client from async code.",
             )
             return None
-        self._tasks.add(task)
+        self._tasks[task] = events
+        self._queued_events += events
         task.add_done_callback(self._task_done)
+        dropped = 0
+        while self._queued_events > _MAX_QUEUED_EVENTS and len(self._tasks) > 1:
+            oldest = next(iter(self._tasks))
+            if oldest.done():  # sent; its done callback just hasn't run yet
+                self._task_done(oldest)
+            else:
+                dropped += self._cancel(oldest)
+        if dropped:
+            self._drop_overflow(dropped)
         return task
 
+    def _cancel(self, task: "asyncio.Task[Any]") -> int:
+        """Cancels an audit task on purpose (its drop is reported by the caller). Returns its events."""
+        events = self._tasks.pop(task, 0)
+        self._queued_events -= events
+        task.cancel()
+        return events
+
     def _task_done(self, task: "asyncio.Task[Any]") -> None:
-        self._tasks.discard(task)
-        if not task.cancelled() and task.exception() is not None and self._config.debug:
+        events = self._tasks.pop(task, None)
+        if events is None:  # cancelled by _cancel
+            return
+        self._queued_events -= events
+        if task.cancelled():
+            self._drop(
+                "cancelled", events,
+                f"[SignalVault] {events} audit event(s) dropped: the task sending them was cancelled, "
+                f"usually because the event loop stopped. Await client.aclose() before it ends. "
+                f"{{total}} dropped by this client so far.",
+            )
+        elif task.exception() is not None and self._config.debug:
             exc = task.exception()
             traceback.print_exception(type(exc), exc, exc.__traceback__)
 
@@ -1026,48 +1277,33 @@ class _BaseAsyncClient(_ClientCommon):
             content=content,
         )
 
-    async def _post_background(
-        self, body: dict, *, event_id: bool = True, retry: bool = True,
-    ) -> Optional[httpx.Response]:
-        """POST with one retry on connection errors, 5xx, and 429 with a short Retry-After.
-
-        ``event_id`` adds an idempotency key so a retry is never double-counted;
-        it is off only for the fallback ai.request, which relies on the
-        server's request_id de-duplication (the original pre-flight may have
-        been stored before the client gave up). Timeouts are not retried: the
-        server may be slow rather than down, and a retry would hold a worker
-        twice as long. Returns the last response, or None.
-        """
-        event = {"event_id": str(uuid.uuid4()), **body} if event_id else body
-        content = self._encode_event(event)
-        if content is None:
-            return None
-        resp: Optional[httpx.Response] = None
-        delay: Optional[float] = None
+    async def _attempt(self, content: bytes) -> Optional[httpx.Response]:
+        """One POST of a background event; None on a connection error or timeout."""
         try:
-            resp = await self._post(content, self._config.timeout)
-            if 200 <= resp.status_code < 300:
-                return resp
-            delay = _retry_delay(resp)
-        except httpx.TimeoutException:
-            if self._config.debug:
-                traceback.print_exc()
+            return await self._post(content, self._config.timeout)
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
-            delay = 0.25 + random.random() * 0.5
+            return None
 
-        if retry and delay is not None:
-            await asyncio.sleep(delay)
-            try:
-                resp = await self._post(content, self._config.timeout)
-                if 200 <= resp.status_code < 300:
-                    return resp
-            except httpx.HTTPError:
-                if self._config.debug:
-                    traceback.print_exc()
+    async def _post_background(
+        self, body: dict, *, event_id: bool = True, attempt: int = 1,
+    ) -> Optional[httpx.Response]:
+        """POST, retrying connection errors, timeouts, 429 and 5xx, up to ``_MAX_ATTEMPTS`` in all.
 
-        self._log_undelivered(resp)
+        As in the sync client: see ``_BaseSyncClient._post_background``.
+        """
+        event = {"event_id": str(uuid.uuid4()), **body} if event_id and "event_id" not in body else body
+        content = self._encode_event(event)
+        if content is None:
+            return None
+        while True:
+            resp = await self._attempt(content)
+            if not _retryable(resp) or attempt >= _MAX_ATTEMPTS:  # delivered, rejected, or out of attempts
+                break
+            await self._sleep(_retry_delay(resp, attempt, self._random))
+            attempt += 1
+        self._log_undelivered(resp, attempt)
         return resp
 
     async def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
@@ -1087,6 +1323,18 @@ class _BaseAsyncClient(_ClientCommon):
             return self._unavailable(request_id, "network", "SignalVault API is unreachable")
         return self._interpret_preflight(request_id, resp)
 
+    def _fire_response(
+        self, request_id: str, model: str, output: str,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
+    ) -> "Optional[asyncio.Task[Any]]":
+        """Sends the response event (after the fallback ai.request, if any) in the background."""
+        if fallback is _NO_AUDIT:
+            return None
+        return self._spawn(
+            self._send_response_from_parts(request_id, model, output, usage, metadata, fallback=fallback),
+            events=2 if isinstance(fallback, dict) else 1,
+        )
+
     async def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
         usage: Dict[str, Any], metadata: dict, fallback: Any = None,
@@ -1099,6 +1347,16 @@ class _BaseAsyncClient(_ClientCommon):
         await self._post_background(self._response_body(
             request_id, model, output, usage, metadata,
         ))
+
+    def _fire_audit(
+        self, request_id: str, model: str, messages: list, output: str,
+        usage: Dict[str, Any], metadata: dict,
+    ) -> "Optional[asyncio.Task[Any]]":
+        """Sends the mirror-mode request and response events in the background."""
+        return self._spawn(
+            self._send_audit_from_parts(request_id, model, messages, output, usage, metadata),
+            events=2,
+        )
 
     async def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
@@ -1113,17 +1371,28 @@ class _BaseAsyncClient(_ClientCommon):
     # -- Agent tool-use capture ---------------------------------------------
 
     async def _send_tool_call_event(self, opts: ToolRecordOptions) -> None:
-        """Awaitable POST of an agent.tool_call event. Surfaces 4xx via warnings."""
+        """Awaitable POST of an agent.tool_call event. Surfaces 4xx via warnings.
+
+        If the POST fails in a way a retry can fix, the event is retried in the background.
+        """
         body = build_tool_call_body(
             environment=self._config.environment,
             default_metadata=self._config.metadata,
             opts=opts,
         )
-        await self._deliver_tool_call(body, retry=False)
+        event = {"event_id": str(uuid.uuid4()), **body}
+        content = self._encode_event(event)
+        if content is None:
+            return
+        resp = await self._attempt(content)
+        if _retryable(resp):
+            self._spawn(self._deliver_tool_call(event, 2))
+        else:
+            self._warn_tool_call_status(resp.status_code)
 
-    async def _deliver_tool_call(self, body: dict, retry: bool = True) -> None:
-        resp = await self._post_background(body, retry=retry)
-        if resp is not None and resp.status_code != 429:
+    async def _deliver_tool_call(self, body: dict, attempt: int = 1) -> None:
+        resp = await self._post_background(body, attempt=attempt)
+        if not _retryable(resp):
             self._warn_tool_call_status(resp.status_code)
 
     def _fire_tool_call(self, opts: ToolRecordOptions) -> None:
@@ -1718,13 +1987,11 @@ class _AsyncChatCompletions:
                 hide_usage_chunk=hide_usage_chunk,
             )
 
-        self._sv._spawn(
-            self._sv._send_response_from_parts(
-                request_id, kwargs.get("model", ""),
-                (response.choices[0].message.content or "") if response.choices else "",
-                _openai_usage(response.usage),
-                metadata, fallback=fallback,
-            )
+        self._sv._fire_response(
+            request_id, kwargs.get("model", ""),
+            (response.choices[0].message.content or "") if response.choices else "",
+            _openai_usage(response.usage),
+            metadata, fallback=fallback,
         )
         return response
 
@@ -1738,13 +2005,11 @@ class _AsyncChatCompletions:
                 request_id, kwargs, response, metadata, mirror=True, hide_usage_chunk=hide_usage_chunk,
             )
 
-        self._sv._spawn(
-            self._sv._send_audit_from_parts(
-                request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
-                (response.choices[0].message.content or "") if response.choices else "",
-                _openai_usage(response.usage),
-                metadata,
-            )
+        self._sv._fire_audit(
+            request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
+            (response.choices[0].message.content or "") if response.choices else "",
+            _openai_usage(response.usage),
+            metadata,
         )
         return response
 
@@ -1755,15 +2020,13 @@ class _AsyncChatCompletions:
         model = kwargs.get("model", "")
 
         def record(output: str, usage: Dict[str, Any]) -> "Optional[asyncio.Task[Any]]":
-            return self._sv._spawn(
-                self._sv._send_audit_from_parts(
+            if mirror:
+                return self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, usage, metadata,
                 )
-                if mirror else
-                self._sv._send_response_from_parts(
-                    request_id, model, output, usage, metadata, fallback=fallback,
-                )
+            return self._sv._fire_response(
+                request_id, model, output, usage, metadata, fallback=fallback,
             )
 
         return await AsyncSignalVaultStream(stream, _ChunkCollector(hide_usage_chunk), record)._start()
@@ -2010,13 +2273,11 @@ class _AsyncAnthropicMessages:
         if stream:
             return await self._wrap_stream(request_id, kwargs, response, metadata, mirror=False, fallback=fallback)
 
-        self._sv._spawn(
-            self._sv._send_response_from_parts(
-                request_id, kwargs.get("model", ""),
-                _anthropic_output_text(response),
-                _anthropic_usage(response.usage),
-                metadata, fallback=fallback,
-            )
+        self._sv._fire_response(
+            request_id, kwargs.get("model", ""),
+            _anthropic_output_text(response),
+            _anthropic_usage(response.usage),
+            metadata, fallback=fallback,
         )
         return response
 
@@ -2026,13 +2287,11 @@ class _AsyncAnthropicMessages:
         if stream:
             return await self._wrap_stream(request_id, kwargs, response, metadata, mirror=True)
 
-        self._sv._spawn(
-            self._sv._send_audit_from_parts(
-                request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
-                _anthropic_output_text(response),
-                _anthropic_usage(response.usage),
-                metadata,
-            )
+        self._sv._fire_audit(
+            request_id, kwargs.get("model", ""), self._sv._audit_messages(kwargs),
+            _anthropic_output_text(response),
+            _anthropic_usage(response.usage),
+            metadata,
         )
         return response
 
@@ -2043,15 +2302,13 @@ class _AsyncAnthropicMessages:
         model = kwargs.get("model", "")
 
         def record(output: str, usage: Dict[str, Any]) -> "Optional[asyncio.Task[Any]]":
-            return self._sv._spawn(
-                self._sv._send_audit_from_parts(
+            if mirror:
+                return self._sv._fire_audit(
                     request_id, model, self._sv._audit_messages(kwargs),
                     output, usage, metadata,
                 )
-                if mirror else
-                self._sv._send_response_from_parts(
-                    request_id, model, output, usage, metadata, fallback=fallback,
-                )
+            return self._sv._fire_response(
+                request_id, model, output, usage, metadata, fallback=fallback,
             )
 
         return await AsyncSignalVaultStream(stream, _AnthropicEventCollector(), record)._start()

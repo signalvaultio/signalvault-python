@@ -151,7 +151,8 @@ weather = await fetch_weather("London")
 ### Manual API
 
 ```python
-# Sync — blocks on the HTTP send so errors surface to the caller
+# Sync — blocks on the first HTTP send so a rejected event (4xx) warns at your call;
+# if SignalVault is unreachable or rate limiting, the event is retried in the background
 client.tools.record(
     tool_name="fetch_weather",
     tool_input={"city": "London"},
@@ -231,9 +232,14 @@ The pre-flight guardrail check is in your request's critical path. If it cannot 
 - `"open"` (default): the request goes to the provider **without** guardrails, and the SDK emits a `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
 - `"closed"`: the SDK raises `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
 
-`fail_mode` applies to the pre-flight check, so it has no effect in mirror mode.
+The pre-flight check tells SignalVault which `fail_mode` the client uses, so the audit log shows whether a request that could not be checked went to the provider. `fail_mode` applies to the pre-flight check, so it has no effect in mirror mode.
 
-**Rate limit.** The ingest API allows 120 events per minute per app, and each call sends two (request and response), plus one per tool call. Above roughly 60 LLM calls a minute, pre-flight checks are rate limited: with `fail_mode="open"` those requests go through unchecked. If you run at that volume and need enforcement, use `fail_mode="closed"`.
+**Rate limit.** Rule checks are limited to 120 requests per minute per app. Above that, SignalVault still records the request, without running your rules, and answers 429:
+
+- With `fail_mode="open"` the request goes to the provider unchecked, with a `SignalVaultWarning`. Its response and tool calls are recorded as usual, so the audit log stays complete.
+- With `fail_mode="closed"` the SDK raises `SignalVaultUnavailableError` (`status` 429) and the provider is never called.
+
+If you run at that volume and need every request checked, use `fail_mode="closed"`. Audit events (responses, tool calls, mirror-mode events) have their own, higher limit of 3,000 per minute per app.
 
 ```python
 client = SignalVaultClient(
@@ -247,7 +253,16 @@ client = SignalVaultClient(
 
 `base_url` defaults to `https://api.signalvault.io`. Plain `http://` is refused except for `localhost`, as is a URL with a query string or fragment.
 
-Audit events (responses, mirror-mode events, tool calls) are sent in the background. Each carries an `event_id`, so a retry is never double-counted. The SDK retries once on connection errors and 5xx (not on timeouts). A rate-limited (429) event is retried only if `Retry-After` is 5 seconds or less; the SignalVault API currently asks for 60, so in practice those events are dropped, with a warning. `tools.record()` does not retry.
+### Background delivery
+
+Audit events (responses, mirror-mode events, tool calls) are queued in memory and sent in the background, without blocking your call:
+
+- **Retries.** An event that fails with a connection error, a timeout, a 5xx or a 429 is retried with exponential backoff: up to 6 attempts over about two minutes (waits of about 4, 8, 16, 32 and 60 seconds). A 429's `Retry-After` is honoured, up to 60 seconds. Other 4xx responses mean the event was rejected, and it is not retried. Each event carries an `event_id`, so a retry is never double-counted. `tools.record()` makes the first attempt itself; if that one can be retried, the rest happen in the background.
+- **Queue.** Up to 1,000 events per client wait to be sent. When the queue is full, the oldest are dropped to make room.
+- **Drops.** Dropping is the last resort, and the SDK says so: a `SignalVaultWarning` whenever events are dropped (a full queue, all attempts used, or events still queued when the client is closed, the event loop stops or the process exits), at most once a minute per cause, with the number dropped so far.
+- **Order.** A call's request is sent before its response, retries included.
+
+The sync clients send from up to 4 background threads per client; the async clients send from tasks on the running event loop.
 
 ## Shutting Down
 
@@ -261,6 +276,10 @@ await client.aclose()   # async: same; required — pending async events are los
 client.flush()
 await async_client.flush()
 ```
+
+`close()`, `aclose()` and `flush()` take a `timeout` in seconds. Events still queued when `close()` or `aclose()` gives up are dropped, with a warning; `flush()` leaves them queued. An event waiting to be retried can take up to two minutes, so pass a longer `timeout` if you need every event through an outage.
+
+If a sync client is never closed, the SDK gives its queued events up to 3 seconds when the interpreter exits, retrying without waiting for the backoff, and never holds the process longer. Events still queued then are dropped, with a warning.
 
 ## Error Handling
 

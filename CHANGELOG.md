@@ -7,6 +7,25 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- Requests over the rule-check rate limit (120 a minute per app) are recorded. From SignalVault 0.17.2 the server stores such a request without running the rules and answers 429 with `"recorded": true`. There is still no decision, so the SDK follows `fail_mode` as for any check it can't get: with `"open"` it warns (the warning says the request is still recorded) and calls the provider, then records the response and tool calls as usual, linked by `request_id`; with `"closed"` it raises `SignalVaultUnavailableError` as before. No fallback `ai.request` is sent, since the server already has it. Before, nothing of a rate-limited call was recorded. A 429 without `"recorded": true` (for example the trial limit) is handled as before.
+- The pre-flight `ai.request` carries `payload.fail_mode` (`"open"` or `"closed"`), so SignalVault can record whether a request it could not check was sent to the provider. The fallback `ai.request` carries it too (always `"open"`, since `"closed"` never sends one). Mirror-mode requests don't: they never wait for a decision.
+
+### Changed
+
+- Audit events (responses, mirror-mode events, tool calls, the fallback `ai.request`) are queued and retried, instead of retried once. Connection errors, timeouts (not retried before), 5xx and 429 are retried with exponential backoff and jitter: up to 6 attempts over about two minutes, with waits of about 4, 8, 16, 32 and 60 seconds. A 429's `Retry-After` is honoured, up to 60 seconds; before, an event was dropped when `Retry-After` was over 5 seconds, which with the API's 60 meant every rate-limited event. Other 4xx are not retried. Retries keep the event's `event_id`, so they are never double-counted; the fallback `ai.request` still has none and is de-duplicated by `request_id`, retries included. From SignalVault 0.17.2, audit events have their own limit of 3,000 a minute per app.
+- Up to 1,000 events per client wait to be sent. When the queue is full, the oldest are dropped.
+- Dropped events always emit a `SignalVaultWarning` (at most once a minute per cause) with the number the client has dropped so far: after the last attempt, from a full queue, when `close()` or `aclose()` runs out of time, when the async task sending them is cancelled (usually because the event loop stopped), or at interpreter exit. The "Rate limited (429): audit events are being dropped" warning is gone; a rate-limited event is retried, and warns only if it is finally dropped.
+- `tools.record()` still makes the first attempt itself and warns at your call on a 4xx. If that attempt fails in a way a retry can fix, the event is retried in the background instead of being dropped, so a 5xx no longer emits "tool_call event failed" with `debug=True`.
+- `close()` and `aclose()` drop the events still queued when their `timeout` runs out, with a warning. Before, those were left to fail on the closed connection pool.
+- At interpreter exit, a sync client that was never closed gets up to 3 seconds for its queued events, which are retried without waiting for the backoff. **Note:** before, exit waited for every queued event, however long that took; now events still queued after 3 seconds are dropped, with a warning. Call `client.close(timeout=...)` before exiting to wait longer.
+- Each sync client sends from up to 4 threads of its own, started when there are events to send, instead of a 4-thread pool shared by all clients.
+
+---
+
 ## [0.6.0] — 2026-10-18
 
 Streams return closable stream objects (a breaking change, see Changed), and token counts for Anthropic prompt caching.
