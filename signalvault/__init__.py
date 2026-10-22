@@ -8,6 +8,7 @@ from .client import (  # noqa: E402
     AsyncAnthropicSignalVaultClient,
     AsyncSignalVaultClient,
     AsyncSignalVaultStream,
+    DroppedEvents,
     SignalVaultBlockedError,
     SignalVaultClient,
     SignalVaultStream,
@@ -28,6 +29,7 @@ __all__ = [
     "SignalVaultViolationWarning",
     "SignalVaultStream",
     "AsyncSignalVaultStream",
+    "DroppedEvents",
     "ToolContext",
     "ToolRecordOptions",
 ]

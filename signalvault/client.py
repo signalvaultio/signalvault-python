@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import collections
+import contextlib
 import dataclasses
 import datetime as _datetime
 import decimal
@@ -12,6 +13,7 @@ import enum
 import functools
 import inspect
 import json
+import logging
 import os
 import platform
 import random
@@ -57,8 +59,10 @@ _MAX_QUEUED_EVENTS = 1_000
 _DELIVERY_WORKERS = 4
 # An idle delivery thread waits this long for more events before it exits.
 _WORKER_IDLE_SECONDS = 1.0
-# How long interpreter exit waits for queued audit events.
-_EXIT_FLUSH_SECONDS = 3.0
+# Default for exit_flush_timeout: how long interpreter exit waits for queued audit events.
+_EXIT_FLUSH_SECONDS = 10.0
+# While flush(), close() or interpreter exit is waiting, retries wait at most this long.
+_FLUSH_RETRY_WAIT_SECONDS = 1.0
 # A repeated warning is emitted at most once per this window.
 _WARN_INTERVAL_SECONDS = 60.0
 _DECISIONS = {"allow", "warn", "block", "redact"}
@@ -70,6 +74,10 @@ _RECORDED_CAUSES = {"429-recorded"}
 # Passed as the fallback when no audit events should be sent at all.
 _NO_AUDIT: Any = object()
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
+_MISSING: Any = object()
+
+# Every dropped audit event is logged here, with its event_id, at WARNING.
+logger = logging.getLogger("signalvault")
 
 
 def _emit_warning(message: str, category: type = UserWarning) -> None:
@@ -111,6 +119,40 @@ class SignalVaultConfig:
     timeout: float = 30.0
     # Default metadata attached to every event. Merged with per-call sv_metadata.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Seconds the interpreter's exit waits for queued audit events (sync
+    # clients). 0 sends nothing more at exit.
+    exit_flush_timeout: float = _EXIT_FLUSH_SECONDS
+
+
+@dataclass(frozen=True)
+class DroppedEvents:
+    """Audit events a client gave up on, by cause. Read it from ``client.dropped_events``.
+
+    Each drop is also logged, with the event ids, on the ``signalvault`` logger.
+    """
+
+    # Every attempt failed (connection error, timeout, 429 or 5xx).
+    retries_exhausted: int = 0
+    # The queue was full, so the oldest waiting events were dropped.
+    queue_full: int = 0
+    # Still unsent when close() / aclose() or the interpreter's exit flush
+    # ran out of time, or when the async task sending them was cancelled.
+    shutdown: int = 0
+    # The event could not be serialized to JSON.
+    unserializable: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.retries_exhausted + self.queue_full + self.shutdown + self.unserializable
+
+
+# How each cause reads in the log and the warnings.
+_DROP_CAUSES = {
+    "retries_exhausted": "every attempt failed",
+    "queue_full": "the queue was full",
+    "shutdown": "still unsent at shutdown",
+    "unserializable": "could not be serialized",
+}
 
 
 @dataclass
@@ -221,10 +263,13 @@ def _normalize_api_key(raw: Any) -> str:
 def _build_config(
     api_key: str, base_url: str, environment: str, debug: bool, mirror_mode: bool,
     fail_mode: str, preflight_timeout: float, timeout: float,
-    metadata: Optional[Dict[str, Any]],
+    metadata: Optional[Dict[str, Any]], exit_flush_timeout: float = _EXIT_FLUSH_SECONDS,
 ) -> SignalVaultConfig:
     if fail_mode not in _FAIL_MODES:
         raise ValueError("[SignalVault] fail_mode must be 'open' or 'closed'")
+    if isinstance(exit_flush_timeout, bool) or not isinstance(exit_flush_timeout, (int, float)) \
+            or not 0 <= exit_flush_timeout < float("inf"):
+        raise ValueError("[SignalVault] exit_flush_timeout must be a number of seconds, 0 or more")
     return SignalVaultConfig(
         api_key=_normalize_api_key(api_key),
         base_url=normalize_base_url(base_url),
@@ -235,7 +280,30 @@ def _build_config(
         preflight_timeout=preflight_timeout,
         timeout=timeout,
         metadata=metadata or {},
+        exit_flush_timeout=float(exit_flush_timeout),
     )
+
+
+def _with_event_id(body: dict) -> dict:
+    """The body with an idempotency key, so a retry is never double-counted."""
+    return {"event_id": str(uuid.uuid4()), **body}
+
+
+def _event_with_id(body: dict, event_id: Optional[str]) -> dict:
+    """``body`` with the event_id chosen when it was queued, or a new one."""
+    return {"event_id": event_id, **body} if event_id else _with_event_id(body)
+
+
+def _resolve(waiter: "asyncio.Future[Any]") -> None:
+    if not waiter.done():
+        waiter.set_result(None)
+
+
+def _event_ref(event: dict) -> str:
+    """How an event is named in the drop log: its event_id, or for the fallback ai.request its request_id."""
+    if "event_id" in event:
+        return f"event_id={event['event_id']}"
+    return f"request_id={event.get('request_id')} (fallback ai.request, which has no event_id)"
 
 
 def _merge_metadata(config_meta: Dict[str, Any], call_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -449,7 +517,13 @@ class _ClientCommon:
         self._config = config
         self._last_warned: Dict[str, float] = {}
         self._warn_lock = threading.Lock()
-        self._dropped = 0  # audit events given up on, for the warnings
+        # Audit events given up on, by DroppedEvents field.
+        self._dropped: Dict[str, int] = {name: 0 for name in _DROP_CAUSES}
+        # Events a delivery thread or task has taken and not finished, and
+        # those reported as dropped at shutdown while their sender may still run.
+        self._unsent: Dict[str, None] = {}
+        self._abandoned: set = set()
+        self._refs_lock = threading.Lock()
         # Injectable for tests: jitter for the retry backoff.
         self._random: Callable[[], float] = random.random
 
@@ -519,15 +593,19 @@ class _ClientCommon:
             )
 
     def _encode_event(self, event: dict) -> Optional[bytes]:
-        """The encoded event, or None (with a warning) when it can't be serialized."""
+        """The encoded event, or None (dropped, with a warning) when it can't be serialized."""
         try:
             return _encode_body(event)
         except Exception as exc:
-            self._warn(
-                f"unserializable:{event.get('type')}",
-                f"[SignalVault] {event.get('type')} event dropped: it could not be serialized "
-                f"({type(exc).__name__}: {exc}).",
-            )
+            if self._settle(_event_ref(event)):
+                self._drop(
+                    "unserializable", [_event_ref(event)], f"{type(exc).__name__}: {exc}",
+                    warning=(
+                        f"unserializable:{event.get('type')}",
+                        f"[SignalVault] {event.get('type')} event dropped: it could not be serialized "
+                        f"({type(exc).__name__}: {exc}).",
+                    ),
+                )
             return None
 
     def _preflight_body(self, request_id: str, params: dict, metadata: dict) -> dict:
@@ -594,37 +672,75 @@ class _ClientCommon:
             "payload": {"messages": messages, "monitor_mode": True},
         }
 
-    def _log_undelivered(self, resp: Optional[httpx.Response], attempts: int) -> None:
-        """Reports the outcome of the last attempt: a drop always warns, a rejection only with debug."""
+    def _log_undelivered(self, resp: Optional[httpx.Response], attempts: int, ref: str) -> None:
+        """Reports the outcome of an event's last attempt: a drop always, a rejection only with debug."""
+        if not self._settle(ref):
+            return  # already reported as dropped at shutdown
         if resp is not None and 200 <= resp.status_code < 300:
             return
         if _retryable(resp):
             self._drop(
-                "retries", 1,
-                f"[SignalVault] Audit event dropped after {attempts} attempt{'s' if attempts != 1 else ''} "
-                f"({_undelivered_cause(resp)}). {{total}} dropped by this client so far.",
+                "retries_exhausted", [ref],
+                f"{attempts} attempt{'s' if attempts != 1 else ''}, last: {_undelivered_cause(resp)}",
             )
         elif self._config.debug:
             _emit_warning(f"[SignalVault] Event not delivered: {resp.status_code}", SignalVaultWarning)
 
-    def _drop(self, cause: str, count: int, message: str) -> None:
-        """Counts audit events that will never be sent, and warns at most once a minute per cause.
+    @property
+    def dropped_events(self) -> DroppedEvents:
+        """The audit events this client has dropped so far, by cause. Read-only snapshot."""
+        with self._refs_lock:
+            return DroppedEvents(**self._dropped)
 
-        The last resort: events are retried and queued first. ``{total}`` in
-        ``message`` becomes the number this client has dropped so far.
+    def _drop(
+        self, cause: str, refs: List[str], detail: str = "",
+        warning: Optional[Tuple[str, str]] = None,
+    ) -> None:
+        """Counts audit events that will never be sent, logs their ids, and warns.
+
+        The last resort: events are retried and queued first. Every drop is
+        logged on the ``signalvault`` logger with the event ids (the
+        request_id for a fallback ai.request); the SignalVaultWarning repeats
+        at most once a minute per cause. ``warning`` replaces the default one
+        as (key, message).
         """
-        with self._warn_lock:
-            self._dropped += count
-            total = self._dropped
-        self._warn(f"dropped:{cause}", message.format(total=total))
-
-    def _drop_overflow(self, count: int) -> None:
-        self._drop(
-            "overflow", count,
-            f"[SignalVault] Audit queue full ({_MAX_QUEUED_EVENTS:,} events waiting): the oldest "
-            f"events are being dropped. SignalVault is unreachable or rate limiting this app. "
-            f"{{total}} dropped by this client so far.",
+        if not refs:
+            return
+        with self._refs_lock:
+            self._dropped[cause] += len(refs)
+            total = sum(self._dropped.values())
+        why = _DROP_CAUSES[cause] + (f" ({detail})" if detail else "")
+        logger.warning(
+            "SignalVault dropped %d audit event(s), %s: %s", len(refs), why, ", ".join(refs),
+            extra={"signalvault_drop_cause": cause, "signalvault_dropped": list(refs)},
         )
+        key, message = warning or (
+            f"dropped:{cause}",
+            f"[SignalVault] {len(refs)} audit event(s) dropped, {why}. {total} dropped by this "
+            f"client so far; the ids are logged on the 'signalvault' logger.",
+        )
+        self._warn(key, message)
+
+    def _settle(self, ref: str) -> bool:
+        """Marks an event as finished. False if it was already reported as dropped at shutdown."""
+        with self._refs_lock:
+            self._unsent.pop(ref, None)
+            if ref in self._abandoned:
+                self._abandoned.discard(ref)
+                return False
+        return True
+
+    def _claim_unsent(self, refs: Any, sender_may_continue: bool) -> List[str]:
+        """Takes the events in ``refs`` not finished yet, to be reported as dropped.
+
+        With ``sender_may_continue``, a later ``_settle`` of one of them is
+        ignored, so nothing is reported twice.
+        """
+        with self._refs_lock:
+            claimed = [r for r in refs if self._unsent.pop(r, _MISSING) is not _MISSING]
+            if sender_may_continue:
+                self._abandoned.update(claimed)
+        return claimed
 
     def _warn_tool_call_status(self, status_code: int) -> None:
         """4xx → warns regardless of debug; anything else non-2xx → only when debug=True."""
@@ -667,48 +783,41 @@ class _BaseSyncClient(_ClientCommon):
         self._init_common(config)
         # Never follow redirects: the API key must not be re-sent to another URL.
         self._http = httpx.Client(follow_redirects=False)
-        # Audit sends waiting for a delivery thread: (fn, args, number of events).
-        self._queue: Deque[Tuple[Callable[..., Any], tuple, int]] = collections.deque()
+        # Audit sends waiting for a delivery thread: (fn, args, the events it sends).
+        self._queue: Deque[Tuple[Callable[..., Any], tuple, List[str]]] = collections.deque()
         self._queue_cond = threading.Condition()
         self._queued_events = 0
         self._workers = 0  # delivery threads running
         self._busy = 0  # sends in progress
-        self._busy_events = 0
         self._closing = False
-        self._exiting = False
-        # Set on close() and at interpreter exit, to cut retry waits short.
-        self._wake = threading.Event()
+        # flush(), close() and interpreter exit in progress: retries wait less.
+        self._hurrying = 0
         # Injectable for tests: waits before a retry.
-        self._sleep: Callable[[float], Any] = self._wake.wait
+        self._sleep: Callable[[float], Any] = self._wait_before_retry
         _SYNC_CLIENTS.add(self)
 
     # -- Resource management -------------------------------------------------
 
     def flush(self, timeout: float = 5.0) -> None:
-        """Waits up to ``timeout`` seconds for queued audit events to be sent."""
-        left = self._wait_idle(time.monotonic() + timeout)
+        """Waits up to ``timeout`` seconds for queued audit events to be sent.
+
+        Meanwhile retries wait at most a second. Events still unsent stay queued.
+        """
+        with self._hurry():
+            left = self._wait_idle(time.monotonic() + timeout)
         if left:
             self._warn("flush-timeout", f"[SignalVault] flush() timed out with {left} event(s) still sending.")
 
-    def close(self, timeout: float = 5.0) -> None:
-        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool.
+    def close(self, timeout: float = 10.0) -> None:
+        """Sends queued audit events (up to ``timeout`` seconds), then closes the HTTP pool.
 
-        Events still queued then are dropped, with a warning.
+        Nothing is dropped before the deadline. Events still unsent then can't
+        be sent once the pool is closed: they are dropped, logged with their
+        ids and counted in ``dropped_events``.
         """
-        self._wait_idle(time.monotonic() + timeout)
-        with self._queue_cond:
-            self._closing = True
-            dropped = self._queued_events
-            self._queue.clear()
-            self._queued_events = 0
-            self._queue_cond.notify_all()
-        self._wake.set()
-        if dropped:
-            self._drop(
-                "closed", dropped,
-                f"[SignalVault] {dropped} audit event(s) dropped: the client was closed before "
-                f"they were sent. {{total}} dropped by this client so far.",
-            )
+        with self._hurry():
+            self._wait_idle(time.monotonic() + timeout)
+        self._shut_down("the client was closed before they were sent")
         self._http.close()
 
     def __enter__(self) -> "_BaseSyncClient":
@@ -719,36 +828,36 @@ class _BaseSyncClient(_ClientCommon):
 
     # -- Delivery queue ------------------------------------------------------
 
-    def _submit(self, fn: Callable[..., Any], *args: Any, events: int = 1) -> None:
-        """Queues ``fn(*args)``, which sends ``events`` audit events, for a delivery thread.
+    def _submit(self, fn: Callable[..., Any], *args: Any, refs: Optional[List[str]] = None) -> None:
+        """Queues ``fn(*args)``, which sends the events ``refs`` names, for a delivery thread.
 
         When more than ``_MAX_QUEUED_EVENTS`` are waiting, the oldest are dropped.
         """
+        refs = refs if refs is not None else [f"{getattr(fn, '__name__', 'send')} (no event_id)"]
         with self._queue_cond:
             closed = self._closing
-            dropped = 0
+            dropped: List[str] = []
             start = False
             if not closed:
-                self._queue.append((fn, args, events))
-                self._queued_events += events
+                self._queue.append((fn, args, refs))
+                self._queued_events += len(refs)
                 while self._queued_events > _MAX_QUEUED_EVENTS and len(self._queue) > 1:
-                    _, _, n = self._queue.popleft()
-                    self._queued_events -= n
-                    dropped += n
+                    _, _, oldest = self._queue.popleft()
+                    self._queued_events -= len(oldest)
+                    dropped.extend(oldest)
                 # One more thread if every running one is busy, up to _DELIVERY_WORKERS.
                 start = self._workers < _DELIVERY_WORKERS and self._workers - self._busy < len(self._queue)
                 if start:
                     self._workers += 1
-                self._queue_cond.notify_all()  # flush() waits on it too
+                self._queue_cond.notify_all()  # flush() and retry waits use it too
         if closed:
-            self._drop(
-                "closed", events,
-                "[SignalVault] Audit event dropped: the client is closed. "
-                "{total} dropped by this client so far.",
-            )
+            self._drop("shutdown", refs, "the client is closed")
             return
         if dropped:
-            self._drop_overflow(dropped)
+            self._drop(
+                "queue_full", dropped,
+                f"{_MAX_QUEUED_EVENTS:,} events waiting; SignalVault is unreachable or rate limiting this app",
+            )
         if start:
             self._start_worker()
 
@@ -770,19 +879,27 @@ class _BaseSyncClient(_ClientCommon):
                     self._workers -= 1
                     self._queue_cond.notify_all()
                     return
-                fn, args, events = self._queue.popleft()
-                self._queued_events -= events
+                fn, args, refs = self._queue.popleft()
+                self._queued_events -= len(refs)
                 self._busy += 1
-                self._busy_events += events
+                with self._refs_lock:
+                    self._unsent.update(dict.fromkeys(refs))
             try:
                 fn(*args)
             except Exception:
                 if self._config.debug:
                     traceback.print_exc()
             finally:
+                # Normally each event was settled as it finished; what's left was stopped by an error.
+                left = self._claim_unsent(refs, sender_may_continue=False)
+                if left:
+                    logger.warning(
+                        "SignalVault dropped %d audit event(s), an internal error stopped their delivery: %s",
+                        len(left), ", ".join(left),
+                        extra={"signalvault_drop_cause": "error", "signalvault_dropped": left},
+                    )
                 with self._queue_cond:
                     self._busy -= 1
-                    self._busy_events -= events
                     self._queue_cond.notify_all()
 
     def _wait_idle(self, deadline: float) -> int:
@@ -791,22 +908,61 @@ class _BaseSyncClient(_ClientCommon):
             while self._queued_events or self._busy:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    return self._queued_events + self._busy_events
+                    return self._queued_events + len(self._unsent)
                 self._queue_cond.wait(remaining)
         return 0
 
+    @contextlib.contextmanager
+    def _hurry(self) -> Any:
+        """While flush(), close() or the exit flush waits, retries wait at most a second."""
+        with self._queue_cond:
+            self._hurrying += 1
+            self._queue_cond.notify_all()  # cuts retry waits in progress short
+        try:
+            yield
+        finally:
+            with self._queue_cond:
+                self._hurrying -= 1
+
+    def _wait_before_retry(self, delay: float) -> None:
+        """The default ``_sleep``: ``delay`` seconds, less once someone is waiting for the queue."""
+        start = time.monotonic()
+        with self._queue_cond:
+            while not self._closing:
+                limit = min(delay, _FLUSH_RETRY_WAIT_SECONDS) if self._hurrying else delay
+                remaining = start + limit - time.monotonic()
+                if remaining <= 0:
+                    return
+                self._queue_cond.wait(remaining)
+
     def _pause(self, delay: float) -> bool:
-        """Waits before a retry; at interpreter exit, not at all. False once the client is closing."""
-        if not self._exiting:
-            self._sleep(delay)
+        """Waits before a retry. False once the client is closing."""
+        if self._hurrying:
+            delay = min(delay, _FLUSH_RETRY_WAIT_SECONDS)
+        self._sleep(delay)
         return not self._closing
 
-    def _hurry(self) -> None:
-        """Interpreter exit: retries go out without waiting, while there is time."""
-        self._exiting = True
-        self._wake.set()
+    def _shut_down(self, why: str) -> None:
+        """Stops delivery; drops (and logs, and counts) every event not sent yet."""
+        with self._queue_cond:
+            if self._closing:
+                return
+            queued = [ref for _, _, refs in self._queue for ref in refs]
+            self._queue.clear()
+            self._queued_events = 0
+            # A sender that finishes later must not report these again.
+            sending = self._claim_unsent(list(self._unsent), sender_may_continue=True)
+            self._closing = True
+            self._queue_cond.notify_all()
+        self._drop("shutdown", queued + sending, why)
+
+    def _start_exit(self) -> None:
+        with self._queue_cond:
+            self._hurrying += 1  # for good: the process is exiting
+            self._queue_cond.notify_all()
 
     def _drain_before_exit(self, deadline: float) -> None:
+        """Interpreter exit: sends what it can until ``deadline``, then drops the rest."""
         if self._closing:
             return
         with self._queue_cond:
@@ -815,13 +971,11 @@ class _BaseSyncClient(_ClientCommon):
                 self._workers += 1
         if start:
             self._start_worker()
-        left = self._wait_idle(deadline)
-        if left:
-            self._drop(
-                "exit", left,
-                f"[SignalVault] {left} audit event(s) dropped: the process exited before they "
-                f"were sent. Call client.close() before exiting to wait longer.",
-            )
+        self._wait_idle(deadline)
+        self._shut_down(
+            "the process exited before they were sent; raise exit_flush_timeout "
+            "or call client.flush() before exiting",
+        )
 
     # -- Internal HTTP -------------------------------------------------------
 
@@ -841,6 +995,10 @@ class _BaseSyncClient(_ClientCommon):
             if self._config.debug:
                 traceback.print_exc()
             return None
+        except RuntimeError:
+            if self._closing:  # the pool was closed under it
+                return None
+            raise
 
     def _post_background(
         self, body: dict, *, event_id: bool = True, attempt: int = 1,
@@ -855,7 +1013,7 @@ class _BaseSyncClient(_ClientCommon):
         covers its retries too. ``attempt`` numbers the first attempt, for an
         event already tried once. Returns the last response, or None.
         """
-        event = {"event_id": str(uuid.uuid4()), **body} if event_id and "event_id" not in body else body
+        event = _with_event_id(body) if event_id and "event_id" not in body else body
         content = self._encode_event(event)
         if content is None:
             return None
@@ -866,7 +1024,7 @@ class _BaseSyncClient(_ClientCommon):
             if not self._pause(_retry_delay(resp, attempt, self._random)):
                 break  # the client is closing
             attempt += 1
-        self._log_undelivered(resp, attempt)
+        self._log_undelivered(resp, attempt, _event_ref(event))
         return resp
 
     def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
@@ -893,23 +1051,24 @@ class _BaseSyncClient(_ClientCommon):
         """Queues the response event (after the fallback ai.request, if any). Does not block the caller."""
         if fallback is _NO_AUDIT:
             return
+        event_id = str(uuid.uuid4())
         self._submit(
             self._send_response_from_parts,
-            request_id, model, output, usage, metadata, fallback,
-            events=1 if fallback is None else 2,
+            request_id, model, output, usage, metadata, fallback, event_id,
+            refs=([_event_ref(fallback)] if fallback is not None else []) + [f"event_id={event_id}"],
         )
 
     def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None, event_id: Optional[str] = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
         if fallback is not None:
             # Must land first: the server rejects an ai.response whose ai.request it has not stored.
             self._post_background(fallback, event_id=False)
-        self._post_background(self._response_body(
-            request_id, model, output, usage, metadata,
+        self._post_background(_event_with_id(
+            self._response_body(request_id, model, output, usage, metadata), event_id,
         ))
 
     def _fire_audit(
@@ -917,20 +1076,25 @@ class _BaseSyncClient(_ClientCommon):
         usage: Dict[str, Any], metadata: dict,
     ) -> None:
         """Queues the mirror-mode request and response events. Does not block the caller."""
+        event_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
         self._submit(
             self._send_audit_from_parts,
-            request_id, model, messages, output, usage, metadata,
-            events=2,
+            request_id, model, messages, output, usage, metadata, event_ids,
+            refs=[f"event_id={i}" for i in event_ids],
         )
 
     def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        usage: Dict[str, Any], metadata: dict,
+        usage: Dict[str, Any], metadata: dict, event_ids: Optional[Tuple[str, str]] = None,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
-        self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
-        self._post_background(self._response_body(
-            request_id, model, output, usage, metadata, monitor_mode=True,
+        request_event_id, response_event_id = event_ids or (None, None)
+        self._post_background(_event_with_id(
+            self._mirror_request_body(request_id, model, messages, metadata), request_event_id,
+        ))
+        self._post_background(_event_with_id(
+            self._response_body(request_id, model, output, usage, metadata, monitor_mode=True),
+            response_event_id,
         ))
 
     # -- Agent tool-use capture ---------------------------------------------
@@ -942,18 +1106,17 @@ class _BaseSyncClient(_ClientCommon):
         ``ValueError`` on an invalid ``tool_name``. If the POST fails in a way
         a retry can fix, the event is retried in the background.
         """
-        body = build_tool_call_body(
+        event = _with_event_id(build_tool_call_body(
             environment=self._config.environment,
             default_metadata=self._config.metadata,
             opts=opts,
-        )
-        event = {"event_id": str(uuid.uuid4()), **body}
+        ))
         content = self._encode_event(event)
         if content is None:
             return
         resp = self._attempt(content)
         if _retryable(resp):
-            self._submit(self._deliver_tool_call, event, 2)
+            self._submit(self._deliver_tool_call, event, 2, refs=[_event_ref(event)])
         else:
             self._warn_tool_call_status(resp.status_code)
 
@@ -966,7 +1129,8 @@ class _BaseSyncClient(_ClientCommon):
         """Builds the event now and sends it in the background. Non-blocking."""
         body = self._prepare_tool_call(opts)
         if body is not None:
-            self._submit(self._deliver_tool_call, body)
+            event = _with_event_id(body)
+            self._submit(self._deliver_tool_call, event, refs=[_event_ref(event)])
 
     @property
     def tools(self) -> "_SyncToolsAPI":
@@ -1053,19 +1217,27 @@ class _BaseSyncClient(_ClientCommon):
 _SYNC_CLIENTS: "weakref.WeakSet[_BaseSyncClient]" = weakref.WeakSet()
 
 
-def _flush_at_exit() -> None:
-    """Gives queued audit events ``_EXIT_FLUSH_SECONDS`` to be sent when the interpreter exits.
+# Async clients, whose unsent events are reported (not sent: their loop is gone) at exit.
+_ASYNC_CLIENTS: "weakref.WeakSet[_BaseAsyncClient]" = weakref.WeakSet()
 
-    Retries go out without waiting for their backoff. Delivery threads are
-    daemon threads, so this never keeps the process alive past the deadline;
-    events still queued then are dropped, with a warning.
+
+def _flush_at_exit() -> None:
+    """Gives each sync client's queued audit events ``exit_flush_timeout`` seconds at interpreter exit.
+
+    All clients flush at once, and retries wait at most a second meanwhile.
+    Delivery threads are daemon threads, so this never keeps the process
+    alive past the longest timeout; events still unsent then are dropped,
+    logged with their ids. An async client's events can't be sent without
+    its event loop, so any it still holds are only reported.
     """
-    deadline = time.monotonic() + _EXIT_FLUSH_SECONDS
+    start = time.monotonic()
     clients = list(_SYNC_CLIENTS)
     for client in clients:
-        client._hurry()
+        client._start_exit()
     for client in clients:
-        client._drain_before_exit(deadline)
+        client._drain_before_exit(start + client._config.exit_flush_timeout)
+    for async_client in list(_ASYNC_CLIENTS):
+        async_client._report_unsent_at_exit()
 
 
 atexit.register(_flush_at_exit)
@@ -1171,41 +1343,44 @@ class _BaseAsyncClient(_ClientCommon):
         self._init_common(config)
         # Never follow redirects: the API key must not be re-sent to another URL.
         self._http = httpx.AsyncClient(follow_redirects=False)
-        # Audit tasks, oldest first, with the number of events each sends.
+        # Audit tasks, oldest first, with the events each sends.
         # Strong references: the event loop keeps only weak references to
         # tasks, so an unreferenced audit task can be garbage-collected mid-send.
-        self._tasks: Dict["asyncio.Task[Any]", int] = {}
+        self._tasks: Dict["asyncio.Task[Any]", List[str]] = {}
         self._queued_events = 0
+        self._closed = False
+        # flush() or aclose() in progress: retries wait less.
+        self._hurrying = 0
+        self._retry_waiters: set = set()
         # Injectable for tests: waits before a retry.
-        self._sleep: Callable[[float], Awaitable[Any]] = asyncio.sleep
+        self._sleep: Callable[[float], Awaitable[Any]] = self._wait_before_retry
+        _ASYNC_CLIENTS.add(self)
 
     # -- Resource management -------------------------------------------------
 
     async def flush(self, timeout: float = 5.0) -> None:
-        """Waits up to ``timeout`` seconds for queued audit events to be sent."""
-        tasks = [t for t in self._tasks if not t.done()]
-        if not tasks:
-            return
-        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        """Waits up to ``timeout`` seconds for queued audit events to be sent.
+
+        Meanwhile retries wait at most a second. Events still unsent stay queued.
+        """
+        pending = await self._wait_tasks(timeout)
         if pending:
-            left = sum(self._tasks.get(t, 0) for t in pending)
+            left = sum(len(self._tasks.get(t, ())) for t in pending)
             self._warn("flush-timeout", f"[SignalVault] flush() timed out with {left} event(s) still sending.")
 
-    async def aclose(self, timeout: float = 5.0) -> None:
-        """Sends queued audit events (up to ``timeout``), then closes the HTTP pool.
+    async def aclose(self, timeout: float = 10.0) -> None:
+        """Sends queued audit events (up to ``timeout`` seconds), then closes the HTTP pool.
 
-        Events still queued then are dropped, with a warning.
+        Nothing is dropped before the deadline. Events still unsent then can't
+        be sent once the pool is closed: they are dropped, logged with their
+        ids and counted in ``dropped_events``.
         """
-        tasks = [t for t in self._tasks if not t.done()]
-        if tasks:
-            _, pending = await asyncio.wait(tasks, timeout=timeout)
-            dropped = sum(self._cancel(t) for t in pending)
-            if dropped:
-                self._drop(
-                    "closed", dropped,
-                    f"[SignalVault] {dropped} audit event(s) dropped: the client was closed before "
-                    f"they were sent. {{total}} dropped by this client so far.",
-                )
+        pending = await self._wait_tasks(timeout)
+        self._closed = True
+        dropped: List[str] = []
+        for task in pending:
+            dropped += self._cancel(task)
+        self._drop("shutdown", dropped, "the client was closed before they were sent")
         await self._http.aclose()
 
     async def __aenter__(self) -> "_BaseAsyncClient":
@@ -1214,12 +1389,30 @@ class _BaseAsyncClient(_ClientCommon):
     async def __aexit__(self, *args: Any) -> None:
         await self.aclose()
 
-    def _spawn(self, coro: Awaitable[Any], events: int = 1) -> "Optional[asyncio.Task[Any]]":
-        """Runs ``coro``, which sends ``events`` audit events, in the background.
+    async def _wait_tasks(self, timeout: float) -> set:
+        """Waits up to ``timeout`` for the audit tasks, with short retry waits. Returns those left."""
+        tasks = [t for t in self._tasks if not t.done()]
+        if not tasks:
+            return set()
+        self._hurrying += 1
+        self._wake_retry_waiters()
+        try:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+        finally:
+            self._hurrying -= 1
+        return pending
+
+    def _spawn(self, coro: Awaitable[Any], refs: Optional[List[str]] = None) -> "Optional[asyncio.Task[Any]]":
+        """Runs ``coro``, which sends the events ``refs`` names, in the background.
 
         When more than ``_MAX_QUEUED_EVENTS`` are unsent, the oldest tasks are
         cancelled and their events dropped.
         """
+        refs = refs if refs is not None else [f"{getattr(coro, '__name__', 'send')} (no event_id)"]
+        if self._closed:
+            coro.close()  # type: ignore[attr-defined]
+            self._drop("shutdown", refs, "the client is closed")
+            return None
         try:
             task = asyncio.get_running_loop().create_task(coro)  # type: ignore[arg-type]
         except RuntimeError:
@@ -1230,42 +1423,86 @@ class _BaseAsyncClient(_ClientCommon):
                 "Use the async client from async code.",
             )
             return None
-        self._tasks[task] = events
-        self._queued_events += events
+        self._tasks[task] = refs
+        self._queued_events += len(refs)
+        with self._refs_lock:
+            self._unsent.update(dict.fromkeys(refs))
         task.add_done_callback(self._task_done)
-        dropped = 0
+        dropped: List[str] = []
         while self._queued_events > _MAX_QUEUED_EVENTS and len(self._tasks) > 1:
             oldest = next(iter(self._tasks))
-            if oldest.done():  # sent; its done callback just hasn't run yet
+            if oldest.done():  # finished; its done callback just hasn't run yet
                 self._task_done(oldest)
             else:
                 dropped += self._cancel(oldest)
         if dropped:
-            self._drop_overflow(dropped)
+            self._drop(
+                "queue_full", dropped,
+                f"{_MAX_QUEUED_EVENTS:,} events waiting; SignalVault is unreachable or rate limiting this app",
+            )
         return task
 
-    def _cancel(self, task: "asyncio.Task[Any]") -> int:
-        """Cancels an audit task on purpose (its drop is reported by the caller). Returns its events."""
-        events = self._tasks.pop(task, 0)
-        self._queued_events -= events
+    def _cancel(self, task: "asyncio.Task[Any]") -> List[str]:
+        """Cancels an audit task on purpose. Returns its unsent events, for the caller to report."""
+        refs = self._tasks.pop(task, [])
+        self._queued_events -= len(refs)
         task.cancel()
-        return events
+        return self._claim_unsent(refs, sender_may_continue=False)
 
     def _task_done(self, task: "asyncio.Task[Any]") -> None:
-        events = self._tasks.pop(task, None)
-        if events is None:  # cancelled by _cancel
+        refs = self._tasks.pop(task, None)
+        if refs is None:  # cancelled by _cancel, which reported it
             return
-        self._queued_events -= events
+        self._queued_events -= len(refs)
+        left = self._claim_unsent(refs, sender_may_continue=False)
         if task.cancelled():
             self._drop(
-                "cancelled", events,
-                f"[SignalVault] {events} audit event(s) dropped: the task sending them was cancelled, "
-                f"usually because the event loop stopped. Await client.aclose() before it ends. "
-                f"{{total}} dropped by this client so far.",
+                "shutdown", left,
+                "the task sending them was cancelled, usually because the event loop stopped; "
+                "await client.aclose() before it ends",
             )
-        elif task.exception() is not None and self._config.debug:
+            return
+        if task.exception() is not None and self._config.debug:
             exc = task.exception()
             traceback.print_exception(type(exc), exc, exc.__traceback__)
+        if left:  # normally each event was settled as it finished
+            logger.warning(
+                "SignalVault dropped %d audit event(s), an internal error stopped their delivery: %s",
+                len(left), ", ".join(left),
+                extra={"signalvault_drop_cause": "error", "signalvault_dropped": left},
+            )
+
+    def _report_unsent_at_exit(self) -> None:
+        if not self._closed:
+            self._drop(
+                "shutdown", self._claim_unsent(list(self._unsent), sender_may_continue=False),
+                "the process exited while its event loop still held them; "
+                "await client.aclose() before the loop ends",
+            )
+
+    async def _wait_before_retry(self, delay: float) -> None:
+        """The default ``_sleep``: ``delay`` seconds, or until flush() or aclose() starts waiting."""
+        loop = asyncio.get_running_loop()
+        waiter = loop.create_future()
+        handle = loop.call_later(delay, _resolve, waiter)
+        self._retry_waiters.add(waiter)
+        try:
+            await waiter
+        finally:
+            handle.cancel()
+            self._retry_waiters.discard(waiter)
+
+    def _wake_retry_waiters(self) -> None:
+        for waiter in list(self._retry_waiters):
+            try:
+                _resolve(waiter)
+            except RuntimeError:  # its event loop is closed
+                pass
+
+    async def _pause(self, delay: float) -> None:
+        if self._hurrying:
+            delay = min(delay, _FLUSH_RETRY_WAIT_SECONDS)
+        await self._sleep(delay)
 
     # -- Internal HTTP -------------------------------------------------------
 
@@ -1293,7 +1530,7 @@ class _BaseAsyncClient(_ClientCommon):
 
         As in the sync client: see ``_BaseSyncClient._post_background``.
         """
-        event = {"event_id": str(uuid.uuid4()), **body} if event_id and "event_id" not in body else body
+        event = _with_event_id(body) if event_id and "event_id" not in body else body
         content = self._encode_event(event)
         if content is None:
             return None
@@ -1301,9 +1538,9 @@ class _BaseAsyncClient(_ClientCommon):
             resp = await self._attempt(content)
             if not _retryable(resp) or attempt >= _MAX_ATTEMPTS:  # delivered, rejected, or out of attempts
                 break
-            await self._sleep(_retry_delay(resp, attempt, self._random))
+            await self._pause(_retry_delay(resp, attempt, self._random))
             attempt += 1
-        self._log_undelivered(resp, attempt)
+        self._log_undelivered(resp, attempt, _event_ref(event))
         return resp
 
     async def _send_request(self, request_id: str, params: dict, metadata: dict) -> Decision:
@@ -1330,22 +1567,25 @@ class _BaseAsyncClient(_ClientCommon):
         """Sends the response event (after the fallback ai.request, if any) in the background."""
         if fallback is _NO_AUDIT:
             return None
+        event_id = str(uuid.uuid4())
         return self._spawn(
-            self._send_response_from_parts(request_id, model, output, usage, metadata, fallback=fallback),
-            events=2 if isinstance(fallback, dict) else 1,
+            self._send_response_from_parts(
+                request_id, model, output, usage, metadata, fallback=fallback, event_id=event_id,
+            ),
+            refs=([_event_ref(fallback)] if fallback is not None else []) + [f"event_id={event_id}"],
         )
 
     async def _send_response_from_parts(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Any = None, event_id: Optional[str] = None,
     ) -> None:
         if fallback is _NO_AUDIT:
             return
         if fallback is not None:
             # Must land first: the server rejects an ai.response whose ai.request it has not stored.
             await self._post_background(fallback, event_id=False)
-        await self._post_background(self._response_body(
-            request_id, model, output, usage, metadata,
+        await self._post_background(_event_with_id(
+            self._response_body(request_id, model, output, usage, metadata), event_id,
         ))
 
     def _fire_audit(
@@ -1353,19 +1593,24 @@ class _BaseAsyncClient(_ClientCommon):
         usage: Dict[str, Any], metadata: dict,
     ) -> "Optional[asyncio.Task[Any]]":
         """Sends the mirror-mode request and response events in the background."""
+        event_ids = (str(uuid.uuid4()), str(uuid.uuid4()))
         return self._spawn(
-            self._send_audit_from_parts(request_id, model, messages, output, usage, metadata),
-            events=2,
+            self._send_audit_from_parts(request_id, model, messages, output, usage, metadata, event_ids),
+            refs=[f"event_id={i}" for i in event_ids],
         )
 
     async def _send_audit_from_parts(
         self, request_id: str, model: str, messages: list, output: str,
-        usage: Dict[str, Any], metadata: dict,
+        usage: Dict[str, Any], metadata: dict, event_ids: Optional[Tuple[str, str]] = None,
     ) -> None:
         """Sequential on purpose: the server rejects an ai.response whose ai.request it has not stored."""
-        await self._post_background(self._mirror_request_body(request_id, model, messages, metadata))
-        await self._post_background(self._response_body(
-            request_id, model, output, usage, metadata, monitor_mode=True,
+        request_event_id, response_event_id = event_ids or (None, None)
+        await self._post_background(_event_with_id(
+            self._mirror_request_body(request_id, model, messages, metadata), request_event_id,
+        ))
+        await self._post_background(_event_with_id(
+            self._response_body(request_id, model, output, usage, metadata, monitor_mode=True),
+            response_event_id,
         ))
 
     # -- Agent tool-use capture ---------------------------------------------
@@ -1375,18 +1620,17 @@ class _BaseAsyncClient(_ClientCommon):
 
         If the POST fails in a way a retry can fix, the event is retried in the background.
         """
-        body = build_tool_call_body(
+        event = _with_event_id(build_tool_call_body(
             environment=self._config.environment,
             default_metadata=self._config.metadata,
             opts=opts,
-        )
-        event = {"event_id": str(uuid.uuid4()), **body}
+        ))
         content = self._encode_event(event)
         if content is None:
             return
         resp = await self._attempt(content)
         if _retryable(resp):
-            self._spawn(self._deliver_tool_call(event, 2))
+            self._spawn(self._deliver_tool_call(event, 2), refs=[_event_ref(event)])
         else:
             self._warn_tool_call_status(resp.status_code)
 
@@ -1399,7 +1643,8 @@ class _BaseAsyncClient(_ClientCommon):
         """Builds the event now and schedules the send on the running loop. Non-blocking."""
         body = self._prepare_tool_call(opts)
         if body is not None:
-            self._spawn(self._deliver_tool_call(body))
+            event = _with_event_id(body)
+            self._spawn(self._deliver_tool_call(event), refs=[_event_ref(event)])
 
     @property
     def tools(self) -> "_AsyncToolsAPI":
@@ -1941,11 +2186,12 @@ class SignalVaultClient(_BaseSyncClient):
         preflight_timeout: float = 2.0,
         timeout: float = 30.0,
         metadata: Optional[Dict[str, Any]] = None,
+        exit_flush_timeout: float = _EXIT_FLUSH_SECONDS,
     ):
         from openai import OpenAI
         super().__init__(_build_config(
             api_key, base_url, environment, debug, mirror_mode,
-            fail_mode, preflight_timeout, timeout, metadata,
+            fail_mode, preflight_timeout, timeout, metadata, exit_flush_timeout,
         ))
         self._openai = OpenAI(api_key=openai_api_key)
         self.chat = _Chat(self)
@@ -2227,6 +2473,7 @@ class AnthropicSignalVaultClient(_BaseSyncClient):
         preflight_timeout: float = 2.0,
         timeout: float = 30.0,
         metadata: Optional[Dict[str, Any]] = None,
+        exit_flush_timeout: float = _EXIT_FLUSH_SECONDS,
     ):
         try:
             import anthropic as _anthropic
@@ -2236,7 +2483,7 @@ class AnthropicSignalVaultClient(_BaseSyncClient):
             )
         super().__init__(_build_config(
             api_key, base_url, environment, debug, mirror_mode,
-            fail_mode, preflight_timeout, timeout, metadata,
+            fail_mode, preflight_timeout, timeout, metadata, exit_flush_timeout,
         ))
         self._anthropic = _anthropic.Anthropic(api_key=anthropic_api_key)
         self.messages = _AnthropicMessages(self)

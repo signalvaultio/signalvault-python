@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import threading
 import time
 import warnings
@@ -567,7 +568,7 @@ class TestBackgroundDelivery:
         client = sync_client(server)
         held = []
         # Hold the background job until after the mutation, so the test is deterministic.
-        with patch.object(client, "_submit", side_effect=lambda fn, *a: held.append((fn, a))):
+        with patch.object(client, "_submit", side_effect=lambda fn, *a, **kw: held.append((fn, a))):
             args = {"city": "London"}
             client.tool("lookup", lambda a: "ok")(args)
             args["city"] = "MUTATED"
@@ -708,6 +709,20 @@ class TestToolCallWarnings:
             await client.tools.record(tool_name="t", duration_ms=1)
 
 
+def wait_sent(client) -> None:
+    """Waits for a sync client's queue like flush(), but without shortening the retry waits."""
+    assert client._wait_idle(time.monotonic() + 5) == 0
+
+
+async def async_wait_sent(client) -> None:
+    """Waits for an async client's tasks like flush(), but without shortening the retry waits."""
+    await asyncio.wait(list(client._tasks), timeout=5)
+
+
+def drop_records(caplog) -> List[logging.LogRecord]:
+    return [r for r in caplog.records if r.name == "signalvault" and "dropped" in r.getMessage()]
+
+
 class TestRetryPolicy:
     def test_backs_off_exponentially_for_about_two_minutes(self):
         server = Server({"agent.tool_call": [{"status": 503}] * 5})
@@ -716,10 +731,11 @@ class TestRetryPolicy:
         with warnings.catch_warnings():
             warnings.simplefilter("error", SignalVaultWarning)
             client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
-            client.flush()
+            wait_sent(client)
         assert waits == [4.0, 8.0, 16.0, 32.0, 60.0]
         assert server.types() == ["agent.tool_call"] * 6
         assert len({b["event_id"] for b in server.bodies}) == 1
+        assert client.dropped_events == signalvault.DroppedEvents()
 
     def test_429_waits_as_long_as_retry_after_says_up_to_a_minute(self):
         server = Server({"ai.request": [ALLOW], "ai.response": [
@@ -733,19 +749,61 @@ class TestRetryPolicy:
         with warnings.catch_warnings():
             warnings.simplefilter("error", SignalVaultWarning)
             client.chat.completions.create(model="m", messages=MESSAGES)
-            client.flush()
+            wait_sent(client)
         assert waits == [0.0, 30.0, 60.0, 32.0]  # no Retry-After on the 4th: the backoff
         responses = [b for b in server.bodies if b["type"] == "ai.response"]
         assert len(responses) == 5
         assert len({r["event_id"] for r in responses}) == 1
 
-    def test_gives_up_after_six_attempts_with_a_warning(self):
+    def test_flush_shortens_the_retry_waits(self):
+        server = Server({"agent.tool_call": [{"status": 503}] * 3})
+        client = sync_client(server)
+        waits = record_waits(client)
+        with client._hurry():  # what flush(), close() and the exit flush wait in
+            client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+            wait_sent(client)
+        assert waits == [1.0, 1.0, 1.0]
+        assert server.types() == ["agent.tool_call"] * 4
+
+    def test_gives_up_after_six_attempts_logs_the_event_id_and_counts_it(self, caplog):
         server = Server({"ai.request": [ALLOW], "ai.response": [{"status": 429}] * 6})
         client = sync_client(server)
-        with pytest.warns(SignalVaultWarning, match=r"dropped after 6 attempts \(rate limited, 429\)"):
+        with pytest.warns(SignalVaultWarning, match=r"1 audit event\(s\) dropped, every attempt failed \(6 attempts, last: rate limited, 429\)"):
             client.chat.completions.create(model="m", messages=MESSAGES)
             client.flush()
         assert server.types().count("ai.response") == 6
+        event_id = server.bodies[-1]["event_id"]
+        [record] = drop_records(caplog)
+        assert record.levelno == logging.WARNING
+        assert f"event_id={event_id}" in record.getMessage()
+        assert record.signalvault_drop_cause == "retries_exhausted"
+        assert record.signalvault_dropped == [f"event_id={event_id}"]
+        assert client.dropped_events == signalvault.DroppedEvents(retries_exhausted=1)
+        assert client.dropped_events.total == 1
+
+    def test_every_drop_is_logged_though_the_warning_repeats_once_a_minute(self, caplog):
+        server = Server({"agent.tool_call": [{"status": 503}] * 12})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for name in ("a", "b"):
+                client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
+                client.flush()
+        assert len([w for w in caught if issubclass(w.category, SignalVaultWarning)]) == 1
+        assert len(drop_records(caplog)) == 2
+        assert client.dropped_events.retries_exhausted == 2
+
+    def test_dropped_fallback_request_is_logged_by_request_id(self, caplog):
+        server = Server({"ai.request": [{"status": 503}] * 7})
+        client = sync_client(server)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SignalVaultWarning)
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            client.flush()
+        request_id = server.bodies[0]["request_id"]
+        [record] = drop_records(caplog)
+        assert f"request_id={request_id} (fallback ai.request, which has no event_id)" in record.getMessage()
+        assert server.types()[-1] == "ai.response"  # still sent after the fallback gave up
 
     def test_timeouts_and_connection_errors_are_retried(self):
         attempts = []
@@ -773,6 +831,7 @@ class TestRetryPolicy:
             client.chat.completions.create(model="m", messages=MESSAGES)
             client.flush()
         assert server.types() == ["ai.request", "ai.response"]
+        assert client.dropped_events.total == 0
 
     def test_fallback_request_is_retried_before_the_response(self):
         server = Server({"ai.request": [{"status": 503}, {"status": 503}, {"status": 200}]})
@@ -792,16 +851,52 @@ class TestRetryPolicy:
         assert server.types() == ["agent.tool_call", "agent.tool_call"]
         assert server.bodies[0]["event_id"] == server.bodies[1]["event_id"]
 
+    def test_unserializable_event_is_logged_and_counted(self, caplog):
+        loop: dict = {}
+        loop["self"] = loop
+        server = Server()
+        client = sync_client(server, mirror_mode=True)
+        with pytest.warns(SignalVaultWarning, match="could not be serialized"):
+            client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata={"loop": loop})
+            client.flush()
+        assert client.dropped_events == signalvault.DroppedEvents(unserializable=2)
+        assert [r.signalvault_drop_cause for r in drop_records(caplog)] == ["unserializable"] * 2
+        assert all("event_id=" in r.getMessage() for r in drop_records(caplog))
+
     @pytest.mark.asyncio
     async def test_async_backs_off_and_keeps_the_event_id(self):
         server = Server({"ai.request": [ALLOW], "ai.response": [{"status": 503}, {"status": 429}]})
         client = async_client(server)
         waits = record_waits(client)
         await client.chat.completions.create(model="m", messages=MESSAGES)
-        await client.flush()
+        await async_wait_sent(client)
         assert waits == [4.0, 8.0]
         responses = [b for b in server.bodies if b["type"] == "ai.response"]
         assert len(responses) == 3 and len({r["event_id"] for r in responses}) == 1
+
+    @pytest.mark.asyncio
+    async def test_async_flush_wakes_a_retry_that_is_waiting(self):
+        server = Server({"agent.tool_call": [{"status": 503}]})
+        client = async_client(server)
+        client._sleep = client._wait_before_retry  # the real wait: about 4 seconds here
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        start = time.monotonic()
+        await client.flush(timeout=3)
+        assert time.monotonic() - start < 1
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
+
+    @pytest.mark.asyncio
+    async def test_async_drop_is_logged_and_counted(self, caplog):
+        server = Server({"agent.tool_call": [{"status": 500}] * 6})
+        client = async_client(server)
+        with pytest.warns(SignalVaultWarning, match="every attempt failed"):
+            client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+            await client.flush()
+        [record] = drop_records(caplog)
+        assert f"event_id={server.bodies[0]['event_id']}" in record.getMessage()
+        assert client.dropped_events == signalvault.DroppedEvents(retries_exhausted=1)
 
     @pytest.mark.asyncio
     async def test_async_manual_tool_record_is_retried_in_the_background(self):
@@ -852,93 +947,193 @@ def tool_names(server: Server) -> List[str]:
 
 
 class TestDeliveryQueue:
-    def _blocked_client(self, monkeypatch):
+    def _blocked_client(self, monkeypatch, **kw):
         import signalvault.client as client_module
 
         monkeypatch.setattr(client_module, "_MAX_QUEUED_EVENTS", 3)
         monkeypatch.setattr(client_module, "_DELIVERY_WORKERS", 1)
         server = GatedServer()
-        client = sync_client(server)
+        client = sync_client(server, **kw)
         client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t0"))
         assert server.first_arrived.wait(5)  # t0 is being sent; the rest queue up
         return client, server
 
-    def test_full_queue_drops_the_oldest_with_a_warning(self, monkeypatch):
+    def test_full_queue_drops_the_oldest_logs_their_ids_and_counts_them(self, monkeypatch, caplog):
         client, server = self._blocked_client(monkeypatch)
-        with pytest.warns(SignalVaultWarning, match=r"queue full \(3 events waiting\).*1 dropped"):
+        with pytest.warns(SignalVaultWarning, match=r"dropped, the queue was full \(3 events waiting"):
             for name in ("t1", "t2", "t3", "t4"):
                 client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
         server.release()
         client.flush()
         assert tool_names(server) == ["t0", "t2", "t3", "t4"]
+        [record] = drop_records(caplog)
+        assert record.signalvault_drop_cause == "queue_full"
+        [ref] = record.signalvault_dropped
+        assert ref.startswith("event_id=") and ref[len("event_id="):] not in {b["event_id"] for b in server.bodies}
+        assert client.dropped_events == signalvault.DroppedEvents(queue_full=1)
 
-    def test_close_drops_what_is_still_queued_with_a_warning(self, monkeypatch):
+    def test_close_drops_at_its_deadline_and_logs_the_ids(self, monkeypatch, caplog):
         client, server = self._blocked_client(monkeypatch)
         client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t1"))
-        with pytest.warns(SignalVaultWarning, match="1 audit event.*dropped: the client was closed"):
+        with pytest.warns(SignalVaultWarning, match=r"2 audit event\(s\) dropped, still unsent at shutdown \(the client was closed"):
             client.close(timeout=0.05)
         server.release()
         assert tool_names(server) == ["t0"]
+        [record] = drop_records(caplog)
+        assert len(record.signalvault_dropped) == 2
+        assert f"event_id={server.bodies[0]['event_id']}" in record.signalvault_dropped
+        time.sleep(0.05)  # t0's send ends after the close: not reported again
+        assert client.dropped_events == signalvault.DroppedEvents(shutdown=2)
+        assert len(drop_records(caplog)) == 1
+
+    def test_close_drops_nothing_before_its_deadline(self):
+        server = Server({"agent.tool_call": [{"status": 503}]}, delay=0.2)
+        client = sync_client(server)
+        client._sleep = client._wait_before_retry  # the real wait: about 4 seconds, cut to 1 by close()
+        for name in ("a", "b", "c"):
+            client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
+            client.close(timeout=5)
+        names = tool_names(server)  # whichever came first got the 503 and was retried
+        assert len(names) == 4 and set(names) == {"a", "b", "c"}
+        assert client.dropped_events.total == 0
+
+    def test_close_waits_ten_seconds_by_default(self):
+        import inspect
+
+        assert inspect.signature(SignalVaultClient.close).parameters["timeout"].default == 10.0
+        assert inspect.signature(AsyncSignalVaultClient.aclose).parameters["timeout"].default == 10.0
 
     def test_counts_both_events_of_a_mirror_call(self, monkeypatch):
         client, server = self._blocked_client(monkeypatch)
         client._fire_audit("r1", "m", MESSAGES, "out", {}, {})  # 2 events
-        with pytest.warns(SignalVaultWarning, match="2 dropped"):
+        with pytest.warns(SignalVaultWarning, match="2 audit event"):
             client._fire_audit("r2", "m", MESSAGES, "out", {}, {})
         server.release()
         client.flush()
         assert [b.get("request_id") for b in server.bodies[1:]] == ["r2", "r2"]
+        assert client.dropped_events.queue_full == 2
 
     @pytest.mark.asyncio
-    async def test_async_full_queue_drops_the_oldest_with_a_warning(self, monkeypatch):
+    async def test_async_full_queue_drops_the_oldest_with_their_ids(self, monkeypatch, caplog):
         import signalvault.client as client_module
 
         monkeypatch.setattr(client_module, "_MAX_QUEUED_EVENTS", 3)
         server = Server(delay=0.01)
         client = async_client(server)
-        with pytest.warns(SignalVaultWarning, match=r"queue full.*1 dropped"):
+        with pytest.warns(SignalVaultWarning, match="the queue was full"):
             for name in ("t1", "t2", "t3", "t4"):
                 client._fire_tool_call(signalvault.ToolRecordOptions(tool_name=name))
         await client.flush()
         assert sorted(tool_names(server)) == ["t2", "t3", "t4"]
+        [record] = drop_records(caplog)
+        assert record.signalvault_drop_cause == "queue_full" and len(record.signalvault_dropped) == 1
+        assert client.dropped_events == signalvault.DroppedEvents(queue_full=1)
 
     @pytest.mark.asyncio
-    async def test_async_aclose_drops_what_is_left_with_a_warning(self):
+    async def test_async_aclose_drops_at_its_deadline_and_logs_the_ids(self, caplog):
         server = Server(delay=1.0)
         client = async_client(server)
         client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
-        with pytest.warns(SignalVaultWarning, match="1 audit event.*dropped: the client was closed"):
+        with pytest.warns(SignalVaultWarning, match="the client was closed"):
             await client.aclose(timeout=0.05)
         assert not client._tasks
+        [record] = drop_records(caplog)
+        assert record.signalvault_dropped[0].startswith("event_id=")
+        assert client.dropped_events == signalvault.DroppedEvents(shutdown=1)
+
+    @pytest.mark.asyncio
+    async def test_async_aclose_drops_nothing_before_its_deadline(self):
+        server = Server({"agent.tool_call": [{"status": 503}]}, delay=0.1)
+        client = async_client(server)
+        client._sleep = client._wait_before_retry
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+        await asyncio.sleep(0.15)  # the first attempt failed; the retry waits about 4 seconds
+        await client.aclose(timeout=5)
+        assert server.types() == ["agent.tool_call", "agent.tool_call"]
+        assert client.dropped_events.total == 0
+
+    def test_async_task_cancelled_with_the_loop_is_logged_and_counted(self, caplog):
+        server = Server(delay=5)
+        client = async_client(server)
+
+        async def main():
+            client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
+            await asyncio.sleep(0)
+
+        with pytest.warns(SignalVaultWarning, match="the task sending them was cancelled"):
+            asyncio.run(main())
+        [record] = drop_records(caplog)
+        assert record.signalvault_drop_cause == "shutdown"
+        assert client.dropped_events == signalvault.DroppedEvents(shutdown=1)
 
 
 class TestExitFlush:
-    def test_exit_sends_retries_without_waiting_for_the_backoff(self):
+    def test_exit_flush_timeout_defaults_to_ten_seconds_and_is_validated(self):
+        assert SignalVaultClient(api_key="k", openai_api_key="x")._config.exit_flush_timeout == 10.0
+        assert SignalVaultClient(api_key="k", openai_api_key="x", exit_flush_timeout=0)._config.exit_flush_timeout == 0
+        for bad in (-1, float("inf"), float("nan"), "10", True):
+            with pytest.raises(ValueError, match="exit_flush_timeout"):
+                SignalVaultClient(api_key="k", openai_api_key="x", exit_flush_timeout=bad)
+
+    def test_exit_retries_without_waiting_for_the_backoff(self):
         server = Server({"agent.tool_call": [{"status": 503}]})
         client = sync_client(server)
-        client._sleep = client._wake.wait  # the real wait: about 4 seconds here
+        client._sleep = client._wait_before_retry  # the real wait: about 4 seconds here
         client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t"))
         start = time.monotonic()
         while not server.requests and time.monotonic() - start < 5:
             time.sleep(0.01)
-        client._hurry()
-        client._drain_before_exit(time.monotonic() + 2)
+        client._start_exit()
+        client._drain_before_exit(time.monotonic() + 3)
         assert time.monotonic() - start < 2
         assert server.types() == ["agent.tool_call", "agent.tool_call"]
+        assert client.dropped_events.total == 0
 
-    def test_interpreter_exit_waits_a_few_seconds_at_most_then_warns(self, tmp_path):
+    def test_exit_flush_timeout_zero_sends_nothing_more_and_logs_the_ids(self, monkeypatch, caplog):
+        client, server = TestDeliveryQueue()._blocked_client(monkeypatch, exit_flush_timeout=0)
+        client._fire_tool_call(signalvault.ToolRecordOptions(tool_name="t1"))
+        start = time.monotonic()
+        with pytest.warns(SignalVaultWarning, match="the process exited"):
+            client._start_exit()
+            client._drain_before_exit(start + client._config.exit_flush_timeout)
+        assert time.monotonic() - start < 0.5
+        server.release()
+        [record] = drop_records(caplog)
+        assert len(record.signalvault_dropped) == 2
+        assert client.dropped_events == signalvault.DroppedEvents(shutdown=2)
+
+    def test_async_client_reports_what_its_loop_still_held_at_exit(self, caplog):
+        client = async_client(Server(delay=5))
+        loop = asyncio.new_event_loop()
+        try:
+            loop.call_soon(client._fire_tool_call, signalvault.ToolRecordOptions(tool_name="t"))
+            loop.run_until_complete(asyncio.sleep(0.01))  # the send starts and is left hanging
+            with pytest.warns(SignalVaultWarning, match="the process exited while its event loop"):
+                client._report_unsent_at_exit()
+        finally:
+            for task in list(client._tasks):
+                task.remove_done_callback(client._task_done)
+                task.cancel()
+            loop.run_until_complete(asyncio.sleep(0))
+            loop.close()
+        [record] = drop_records(caplog)
+        assert record.signalvault_dropped[0].startswith("event_id=")
+        assert client.dropped_events == signalvault.DroppedEvents(shutdown=1)
+
+    def test_interpreter_exit_waits_up_to_exit_flush_timeout_then_logs_the_ids(self, tmp_path):
         import os
         import subprocess
         import sys
 
         script = tmp_path / "exit_with_a_stuck_event.py"
         script.write_text(
-            "import time, httpx, signalvault, signalvault.client as c\n"
-            "c._EXIT_FLUSH_SECONDS = 0.5\n"
+            "import time, httpx, signalvault\n"
             "def handler(request):\n"
             "    time.sleep(60)\n"
             "    return httpx.Response(200)\n"
-            "client = signalvault.SignalVaultClient(api_key='k', openai_api_key='x')\n"
+            "client = signalvault.SignalVaultClient(api_key='k', openai_api_key='x', exit_flush_timeout=0.5)\n"
             "client._http = httpx.Client(transport=httpx.MockTransport(handler))\n"
             "client._fire_tool_call(signalvault.ToolRecordOptions(tool_name='t'))\n"
             "print('exiting', flush=True)\n"
@@ -953,7 +1148,10 @@ class TestExitFlush:
         assert proc.stdout == "exiting\n"
         # Startup and imports take most of it; the event's send would take 60 seconds.
         assert time.monotonic() - start < 15
-        assert "1 audit event(s) dropped: the process exited before they were sent" in proc.stderr
+        # The log line (Python's last-resort handler prints WARNING to stderr) and the warning.
+        assert "SignalVault dropped 1 audit event(s), still unsent at shutdown (the process exited" in proc.stderr
+        assert "event_id=" in proc.stderr
+        assert "raise exit_flush_timeout" in proc.stderr
 
 
 class TestAuditWhenPreflightFailed:
