@@ -7,7 +7,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.7.0] — 2026-10-22
+
+Requests over the rule-check rate limit are recorded, audit events are queued and retried for about two minutes, and every dropped event is logged with its id and counted.
 
 ### Added
 
