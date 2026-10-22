@@ -13,6 +13,7 @@ import pytest
 from signalvault import (
     AsyncSignalVaultClient,
     SignalVaultClient,
+    SignalVaultWarning,
 )
 from signalvault.tools import (
     MAX_PAYLOAD_BYTES,
@@ -134,6 +135,7 @@ def sync_client(monkeypatch):
     )
     client._http = MagicMock()
     client._http.post.return_value = _make_response(200)
+    client._sleep = lambda delay: None  # retries go out without waiting
     # Make tool_call submissions synchronous so tests don't race the executor.
     # The wrapper still hits ``_fire_tool_call`` so we exercise the same path,
     # we just bypass the thread hop.
@@ -325,13 +327,18 @@ class TestSyncErrorLogging:
         assert any("422" in m for m in msgs), f"expected 422 warning, got {msgs}"
         assert any("api_key" in m for m in msgs)
 
-    def test_5xx_silent_unless_debug(self, sync_client):
+    def test_5xx_is_retried_in_the_background(self, sync_client):
         sync_client._http.post.return_value = _make_response(503)
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
+        with pytest.warns(SignalVaultWarning) as record:
             sync_client.tools.record(tool_name="svc_down", duration_ms=1)
-        msgs = [str(w.message) for w in caught]
-        assert not any("503" in m for m in msgs)
+            sync_client.flush()
+        # Only once it has given up.
+        assert [str(w.message).split(" (")[0] for w in record] == [
+            "[SignalVault] Audit event dropped after 6 attempts",
+        ]
+        bodies = _post_json_calls(sync_client._http)
+        assert len(bodies) == 6
+        assert len({b["event_id"] for b in bodies}) == 1
 
 
 # ---------------------------------------------------------------------------
