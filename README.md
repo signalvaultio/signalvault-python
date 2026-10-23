@@ -239,7 +239,7 @@ The pre-flight check tells SignalVault which `fail_mode` the client uses, so the
 - With `fail_mode="open"` the request goes to the provider unchecked, with a `SignalVaultWarning`. Its response and tool calls are recorded as usual, so the audit log stays complete.
 - With `fail_mode="closed"` the SDK raises `SignalVaultUnavailableError` (`status` 429) and the provider is never called.
 
-If you run at that volume and need every request checked, use `fail_mode="closed"`. Audit events (responses, tool calls, mirror-mode events) have their own, higher limit of 3,000 per minute per app.
+If you run at that volume and need every request checked, use `fail_mode="closed"`. Audit events (responses, tool calls, mirror-mode events) do not use rule checks. Every event type shares one ceiling of 3,000 events a minute per app.
 
 ```python
 client = SignalVaultClient(
