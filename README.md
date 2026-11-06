@@ -227,7 +227,7 @@ response = client.chat.completions.create(
 
 ## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), server error, an invalid response, or a request that can't be serialized (for example a circular reference in `sv_metadata`) — `fail_mode` decides what happens:
+The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), a request SignalVault records unchecked (429, below), server error, an invalid response, or a request that can't be serialized (for example a circular reference in `sv_metadata`) — `fail_mode` decides what happens:
 
 - `"open"` (default): the request goes to the provider **without** guardrails, and the SDK emits a `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
 - `"closed"`: the SDK raises `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
@@ -239,7 +239,20 @@ The pre-flight check tells SignalVault which `fail_mode` the client uses, so the
 - With `fail_mode="open"` the request goes to the provider unchecked, with a `SignalVaultWarning`. Its response and tool calls are recorded as usual, so the audit log stays complete.
 - With `fail_mode="closed"` the SDK raises `SignalVaultUnavailableError` (`status` 429) and the provider is never called.
 
-If you run at that volume and need every request checked, use `fail_mode="closed"`. Audit events (responses, tool calls, mirror-mode events) do not use rule checks. Every event type shares one ceiling of 3,000 events a minute per app.
+If you run at that volume and need every request checked, use `fail_mode="closed"`. Responses and tool calls do not use rule checks; mirror-mode requests do. Every event type shares one ceiling of 3,000 events a minute per app.
+
+**Content the rules cannot read, and scans that do not finish.** When a rule that reads content is on (`contains_pii`, `contains_secret`, `keyword_blocklist`, `regex_match` or `prompt_injection`) and none of them has the action `block`, SignalVault records two more kinds of request unchecked and answers the same 429 with `"recorded": true`, without `Retry-After`:
+
+- a request carrying content the rules cannot read — an image, audio, a file, a PDF or a content type they do not know — with the reason `unscanned_content` (SignalVault 0.18.9 and later). The audit event names each content type;
+- a request whose rule scan did not finish in time or stopped before the end of the text, with the reason `scan_timeout`.
+
+`fail_mode` applies as above, and the `SignalVaultWarning`, or the message of `SignalVaultUnavailableError`, gives the reason:
+
+```
+[SignalVault] The request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content). Guardrails were NOT applied — it is being sent to the provider (fail_mode='open').
+```
+
+Under a `block` rule that reads content, such a request is blocked instead (see [Error Handling](#error-handling)).
 
 ```python
 client = SignalVaultClient(
@@ -257,7 +270,7 @@ client = SignalVaultClient(
 
 Audit events (responses, mirror-mode events, tool calls) are queued in memory and sent in the background, without blocking your call:
 
-- **Retries.** An event that fails with a connection error, a timeout, a 5xx or a 429 is retried with exponential backoff: up to 6 attempts over about two minutes (waits of about 4, 8, 16, 32 and 60 seconds). A 429's `Retry-After` is honoured, up to 60 seconds. Other 4xx responses mean the event was rejected, and it is not retried. Each event carries an `event_id`, so a retry is never double-counted. `tools.record()` makes the first attempt itself; if that one can be retried, the rest happen in the background.
+- **Retries.** An event that fails with a connection error, a timeout, a 5xx or a 429 is retried with exponential backoff: up to 6 attempts over about two minutes (waits of about 4, 8, 16, 32 and 60 seconds). A 429's `Retry-After` is honoured, up to 60 seconds. Other 4xx responses mean the event was rejected, and it is not retried. A 429 with `"recorded": true` is not retried either: SignalVault has stored the request, unchecked, and would answer a retry the same way, so it counts as delivered and its response is sent. Each event carries an `event_id`, so a retry is never double-counted. `tools.record()` makes the first attempt itself; if that one can be retried, the rest happen in the background.
 - **Queue.** Up to 1,000 events per client wait to be sent. When the queue is full, the oldest are dropped to make room.
 - **Order.** A call's request is sent before its response, retries included.
 - While `flush()`, `close()`, `aclose()` or the exit flush is waiting, retries wait at most a second, so queued events go out within the timeout you gave.
@@ -344,6 +357,8 @@ except SignalVaultUnavailableError as e:
 ```
 
 Both are subclasses of `RuntimeError`.
+
+A request carrying content the rules cannot read, under a `block` rule that reads content, is blocked with a violation of type `unscanned_content_guard`; its `details` hold a `description` and `content_types`, naming each type (SignalVault 0.18.9 and later). One whose rule scan did not finish is blocked with `scan_timeout_guard`.
 
 ### Warnings
 

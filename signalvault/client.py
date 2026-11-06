@@ -17,6 +17,7 @@ import logging
 import os
 import platform
 import random
+import re
 import sys
 import threading
 import time
@@ -69,8 +70,14 @@ _DECISIONS = {"allow", "warn", "block", "redact"}
 _FAIL_MODES = {"open", "closed"}
 # Pre-flight failures where re-sending the ai.request later can succeed.
 _RECORDABLE_CAUSES = {"timeout", "network", "5xx", "invalid-response"}
-# Pre-flight failures where the server stored the ai.request without running the rules.
-_RECORDED_CAUSES = {"429-recorded"}
+# Pre-flight failures where the server stored the ai.request without a decision (a 429
+# with "recorded": true): over the rule-check rate limit ("429-recorded"), or for a
+# reason a retry would not change (_UNCHECKED_CAUSES, see _unchecked_reason).
+_UNCHECKED_CAUSES = {"429-unscanned-content", "429-scan-timeout", "429-unchecked"}
+_RECORDED_CAUSES = {"429-recorded"} | _UNCHECKED_CAUSES
+# A reason in a 429 with "recorded": true that this version does not know is named in
+# the warning when it looks like a code.
+_REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
 # Passed as the fallback when no audit events should be sent at all.
 _NO_AUDIT: Any = object()
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -176,7 +183,7 @@ class Decision:
     # Set when no decision was obtained: "record" if the server may not have
     # stored the request (network, timeout, 5xx, invalid response), "skip" if
     # it refused it (401/402/403/429/3xx), "recorded" if it stored it without
-    # running the rules (a 429 with "recorded": true). Internal.
+    # a decision (a 429 with "recorded": true). Internal.
     _preflight_failed: Optional[str] = field(default=None, repr=False, compare=False)
 
 
@@ -447,9 +454,29 @@ def _encode_body(body: dict) -> bytes:
     ).encode("ascii")
 
 
+def _recorded(resp: Optional[httpx.Response]) -> bool:
+    """Whether a 429 says ``"recorded": true``.
+
+    The server stored the ai.request without checking it (over the rule-check
+    rate limit, a rule scan that did not finish, content the rules cannot
+    read) and answers a replay the same way: the event is delivered, and a
+    retry could never succeed.
+    """
+    if resp is None or resp.status_code != 429:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return isinstance(body, dict) and body.get("recorded") is True
+
+
 def _retryable(resp: Optional[httpx.Response]) -> bool:
-    """Whether a later attempt can succeed: no response (connection error or timeout), 429 or 5xx."""
-    return resp is None or resp.status_code == 429 or resp.status_code >= 500
+    """Whether a later attempt can succeed: no response (connection error or timeout), 5xx,
+    or a 429 other than one with ``"recorded": true``."""
+    if resp is None or resp.status_code >= 500:
+        return True
+    return resp.status_code == 429 and not _recorded(resp)
 
 
 def _retry_delay(resp: Optional[httpx.Response], attempt: int, rand: Callable[[], float]) -> float:
@@ -477,6 +504,29 @@ def _undelivered_cause(resp: Optional[httpx.Response]) -> str:
     return f"SignalVault API error, {resp.status_code}"
 
 
+def _unchecked_reason(reason: Any) -> Optional[Tuple[str, str]]:
+    """Why SignalVault stored a pre-flight unchecked (a 429 with ``"recorded": true``).
+
+    From the body's ``reason``, as (warning key, reason). None for the
+    rule-check rate limit ("pre_flight_rate_limited", or no reason), which
+    keeps its own wording. The body names no content types; the audit event does.
+    """
+    if reason is None or reason == "pre_flight_rate_limited":
+        return None
+    if reason == "unscanned_content":
+        return "429-unscanned-content", (
+            "the request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF "
+            "or a content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content)"
+        )
+    if reason == "scan_timeout":
+        return "429-scan-timeout", (
+            "a rule's scan of the request did not finish in time or stopped before the end of the text, "
+            "so SignalVault recorded it unchecked (429: scan_timeout)"
+        )
+    code = f"429: {reason}" if isinstance(reason, str) and _REASON_CODE.fullmatch(reason) else "429"
+    return "429-unchecked", f"SignalVault recorded the request unchecked ({code})"
+
+
 def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
     """Maps a non-2xx pre-flight response to (warning key, human reason)."""
     try:
@@ -495,8 +545,12 @@ def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
         return "403", f"SignalVault denied access (403: {error_type or 'forbidden'})"
     if status == 429:
         if isinstance(body, dict) and body.get("recorded") is True:
-            # Over the rule-check rate limit: stored without a decision, so
-            # the audit events that follow are accepted.
+            # Stored without a decision, so the audit events that follow are
+            # accepted: over the rule-check rate limit, or for a reason that
+            # is not a limit and a retry would not change.
+            unchecked = _unchecked_reason(body.get("reason"))
+            if unchecked:
+                return unchecked
             return "429-recorded", "SignalVault rule checks are rate limited (429)"
         if error_type == "trial_limit_exceeded":
             return "429-trial", "SignalVault trial limit reached (429)"
@@ -556,12 +610,18 @@ class _ClientCommon:
         if self._config.fail_mode == "closed":
             raise SignalVaultUnavailableError(request_id, reason, status)
         recorded = key in _RECORDED_CAUSES
-        self._warn(
-            f"preflight:{key}",
-            f"[SignalVault] {reason}. Guardrails were NOT applied — requests are being sent "
-            f"to the provider unchecked (fail_mode='open')."
-            + (" They are still recorded in the audit log." if recorded else ""),
-        )
+        if key in _UNCHECKED_CAUSES:
+            message = (
+                f"[SignalVault] {reason[0].upper()}{reason[1:]}. Guardrails were NOT applied — it is "
+                f"being sent to the provider (fail_mode='open')."
+            )
+        else:
+            message = (
+                f"[SignalVault] {reason}. Guardrails were NOT applied — requests are being sent "
+                f"to the provider unchecked (fail_mode='open')."
+                + (" They are still recorded in the audit log." if recorded else "")
+            )
+        self._warn(f"preflight:{key}", message)
         if recorded:
             return Decision(_preflight_failed="recorded")
         return Decision(_preflight_failed="record" if key in _RECORDABLE_CAUSES else "skip")
@@ -569,8 +629,8 @@ class _ClientCommon:
     def _fallback_request(self, decision: Decision, request_id: str, params: dict, metadata: dict) -> Any:
         """What to send before the response when the pre-flight got no decision.
 
-        None: the server stored the pre-flight, with a decision or (over the
-        rule-check rate limit) without one. ``_NO_AUDIT``: the server refused
+        None: the server stored the pre-flight, with a decision or (a 429 with
+        ``"recorded": true``) without one. ``_NO_AUDIT``: the server refused
         it, so a response event would be refused too. Otherwise the ai.request
         body, so an unchecked call still reaches the audit log.
         """
@@ -676,8 +736,8 @@ class _ClientCommon:
         """Reports the outcome of an event's last attempt: a drop always, a rejection only with debug."""
         if not self._settle(ref):
             return  # already reported as dropped at shutdown
-        if resp is not None and 200 <= resp.status_code < 300:
-            return
+        if resp is not None and (200 <= resp.status_code < 300 or _recorded(resp)):
+            return  # delivered
         if _retryable(resp):
             self._drop(
                 "retries_exhausted", [ref],
@@ -1005,6 +1065,7 @@ class _BaseSyncClient(_ClientCommon):
     ) -> Optional[httpx.Response]:
         """POST, retrying connection errors, timeouts, 429 and 5xx, up to ``_MAX_ATTEMPTS`` in all.
 
+        A 429 with ``"recorded": true`` is delivered, not retried (``_recorded``).
         Waits between attempts as ``_retry_delay`` says. ``event_id`` adds an
         idempotency key (unless ``body`` has one) so a retry is never
         double-counted; it is off only for the fallback ai.request, which
