@@ -279,6 +279,22 @@ class TestDecisions:
         assert err.dashboard_url == "https://signalvault.io/x"
         client._openai.chat.completions.create.assert_not_called()
 
+    def test_block_for_unscanned_content_names_its_type_and_carries_the_content_types(self):
+        # Under a block rule, content the rules cannot read is a block (server 0.18.9+).
+        violations = [{
+            "rule_id": "system", "type": "unscanned_content_guard", "severity": 10, "action": "block",
+            "details": {"reason": "unscanned_content", "description": "...", "content_types": ["image_url"]},
+        }]
+        server = Server({"ai.request": [{"status": 200, "json": {
+            "decision": "block", "violations": violations, "redactions": [],
+        }}]})
+        client = sync_client(server)
+        with pytest.raises(SignalVaultBlockedError) as exc:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        assert str(exc.value) == "[SignalVault] Request blocked by guardrails (unscanned_content_guard)."
+        assert exc.value.violations[0].details["content_types"] == ["image_url"]
+        client._openai.chat.completions.create.assert_not_called()
+
     def test_redactions_array_and_request_unmodified(self):
         server = Server({"ai.request": [{"status": 200, "json": {
             "decision": "redact", "violations": [], "redactions": [{"type": "contains_pii", "count": 1}],
@@ -1285,6 +1301,169 @@ class TestRuleCheckRateLimit:
             client.chat.completions.create(model="m", messages=MESSAGES)
             client.chat.completions.create(model="m", messages=MESSAGES)
         assert len(record) == 2
+
+    def test_keeps_its_wording_fail_open_and_fail_closed(self):
+        server = Server({"ai.request": [RECORDED_429, RECORDED_429]})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sync_client(server).chat.completions.create(model="m", messages=MESSAGES)
+        assert sv_warnings(caught) == [
+            "[SignalVault] SignalVault rule checks are rate limited (429). Guardrails were NOT applied — "
+            "requests are being sent to the provider unchecked (fail_mode='open'). They are still recorded "
+            "in the audit log."
+        ]
+        with pytest.raises(SignalVaultUnavailableError) as exc:
+            sync_client(server, fail_mode="closed").chat.completions.create(model="m", messages=MESSAGES)
+        assert str(exc.value) == (
+            "[SignalVault] Guardrail check unavailable: SignalVault rule checks are rate limited (429). "
+            "Request not sent (fail_mode='closed')."
+        )
+
+
+def unchecked_429(reason: str) -> dict:
+    """The server stored the ai.request unchecked for ``reason``, not the rate limit: no Retry-After."""
+    return {"status": 429, "json": {
+        "error": reason, "reason": reason, "recorded": True, "event_id": "ev_1", "decision": "unchecked",
+    }}
+
+
+UNSCANNED = (
+    "the request carries content SignalVault's rules cannot read (an image, audio, a file, a PDF or a "
+    "content type they do not know), so SignalVault recorded it unchecked (429: unscanned_content)"
+)
+SCAN_TIMEOUT = (
+    "a rule's scan of the request did not finish in time or stopped before the end of the text, so "
+    "SignalVault recorded it unchecked (429: scan_timeout)"
+)
+UNCHECKED_REASONS = [("unscanned_content", UNSCANNED), ("scan_timeout", SCAN_TIMEOUT)]
+
+
+def open_warning(text: str) -> str:
+    return (
+        f"[SignalVault] {text[0].upper()}{text[1:]}. Guardrails were NOT applied — it is being sent "
+        f"to the provider (fail_mode='open')."
+    )
+
+
+def sv_warnings(caught) -> List[str]:
+    return [str(w.message) for w in caught if issubclass(w.category, SignalVaultWarning)]
+
+
+class TestRecordedUnchecked:
+    """A 429 with "recorded": true for a reason other than the rule-check rate limit:
+    content the rules cannot read (server 0.18.9+), or a rule scan that did not finish (0.18.3+)."""
+
+    @pytest.mark.parametrize("reason,text", UNCHECKED_REASONS)
+    def test_fail_open_says_why_forwards_and_records_the_response(self, reason, text):
+        server = Server({"ai.request": [unchecked_429(reason)]})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert sv_warnings(caught) == [open_warning(text)]
+        client._openai.chat.completions.create.assert_called_once()
+        # No fallback ai.request: the server already has it.
+        assert server.types() == ["ai.request", "ai.response"]
+        assert server.bodies[1]["request_id"] == server.bodies[0]["request_id"]
+
+    @pytest.mark.parametrize("reason,text", UNCHECKED_REASONS)
+    def test_fail_closed_raises_with_that_reason(self, reason, text):
+        server = Server({"ai.request": [unchecked_429(reason)]})
+        client = sync_client(server, fail_mode="closed")
+        with pytest.raises(SignalVaultUnavailableError) as exc:
+            client.chat.completions.create(model="m", messages=MESSAGES)
+        client.flush()
+        assert str(exc.value) == (
+            f"[SignalVault] Guardrail check unavailable: {text}. Request not sent (fail_mode='closed')."
+        )
+        assert exc.value.status == 429
+        client._openai.chat.completions.create.assert_not_called()
+        assert server.types() == ["ai.request"]
+
+    @pytest.mark.asyncio
+    async def test_async_fail_open_says_why_and_records_the_response(self):
+        server = Server({"ai.request": [unchecked_429("unscanned_content")]})
+        client = async_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            await client.chat.completions.create(model="m", messages=MESSAGES)
+        await client.flush()
+        assert sv_warnings(caught) == [open_warning(UNSCANNED)]
+        assert server.types() == ["ai.request", "ai.response"]
+
+    def test_an_unknown_reason_is_named_not_read_as_the_rate_limit(self):
+        server = Server({"ai.request": [unchecked_429("new_reason"), unchecked_429("<b>not a code</b>")]})
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            sync_client(server).chat.completions.create(model="m", messages=MESSAGES)
+        assert sv_warnings(caught) == [open_warning("SignalVault recorded the request unchecked (429: new_reason)")]
+        with pytest.raises(SignalVaultUnavailableError) as exc:
+            sync_client(server, fail_mode="closed").chat.completions.create(model="m", messages=MESSAGES)
+        assert str(exc.value) == (
+            "[SignalVault] Guardrail check unavailable: SignalVault recorded the request unchecked (429). "
+            "Request not sent (fail_mode='closed')."
+        )
+
+    def test_warns_once_a_minute_per_reason_apart_from_the_rate_limit(self):
+        server = Server({"ai.request": [
+            RECORDED_429, unchecked_429("unscanned_content"), unchecked_429("unscanned_content"),
+            unchecked_429("scan_timeout"),
+        ]})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(4):
+                client.chat.completions.create(model="m", messages=MESSAGES)
+        messages = sv_warnings(caught)
+        assert len(messages) == 3
+        assert "rule checks are rate limited" in messages[0]
+        assert "unscanned_content" in messages[1]
+        assert "scan_timeout" in messages[2]
+
+
+# The server stored the ai.request unchecked and answers a replay the same
+# way, so a retry can never succeed.
+BACKGROUND_RECORDED = [unchecked_429("unscanned_content"), unchecked_429("scan_timeout"), RECORDED_429]
+
+
+class TestBackgroundRequestRecordedUnchecked:
+    @pytest.mark.parametrize("reply", BACKGROUND_RECORDED)
+    def test_mirror_mode_request_is_not_retried_or_dropped_and_the_response_follows(self, reply, caplog):
+        server = Server({"ai.request": [reply] * 6})
+        client = sync_client(server, mirror_mode=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", SignalVaultWarning)
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            wait_sent(client)
+        assert server.types() == ["ai.request", "ai.response"]
+        assert server.bodies[1]["request_id"] == server.bodies[0]["request_id"]
+        assert drop_records(caplog) == []
+        assert client.dropped_events == signalvault.DroppedEvents()
+
+    @pytest.mark.parametrize("reply", BACKGROUND_RECORDED)
+    def test_fallback_request_is_not_retried_or_dropped(self, reply, caplog):
+        server = Server({"ai.request": [{"status": 503}] + [reply] * 6})
+        client = sync_client(server)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            client.chat.completions.create(model="m", messages=MESSAGES)
+            wait_sent(client)
+        assert [m for m in sv_warnings(caught) if "dropped" in m] == []
+        assert server.types() == ["ai.request", "ai.request", "ai.response"]
+        assert server.bodies[1]["payload"]["preflight_unavailable"] is True
+        assert drop_records(caplog) == []
+        assert client.dropped_events == signalvault.DroppedEvents()
+
+    @pytest.mark.asyncio
+    async def test_async_mirror_mode_request_is_not_retried_or_dropped(self, caplog):
+        server = Server({"ai.request": [unchecked_429("unscanned_content")] * 6})
+        client = async_client(server, mirror_mode=True)
+        await client.chat.completions.create(model="m", messages=MESSAGES)
+        await async_wait_sent(client)
+        assert server.types() == ["ai.request", "ai.response"]
+        assert drop_records(caplog) == []
+        assert client.dropped_events == signalvault.DroppedEvents()
 
 
 class TestFailModeInPreflight:
