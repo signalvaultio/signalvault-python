@@ -2,8 +2,12 @@ name: Release
 
 # Publishes to PyPI via trusted publishing (OIDC) when a vX.Y.Z tag is pushed.
 # No PyPI token is stored anywhere; PyPI trusts this workflow file in this repo.
-# The build job has no publish rights; only the publish job gets the OIDC token,
-# and the `release` environment requires manual approval before it runs.
+# The test job runs the tests. The build job checks the tag against the package
+# version and builds dist/ with nothing installed but the pinned, hash-checked
+# build dependencies in .github/requirements-build.txt; no test dependency is in
+# that job. Neither has publish rights; only the publish job, which needs both,
+# gets the OIDC token, and the `release` environment requires manual approval
+# before it runs.
 
 on:
   push:
@@ -13,6 +17,19 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install --upgrade pip
+      - run: pip install -e ".[dev,anthropic]"
+      - run: pytest -q
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -33,10 +50,12 @@ jobs:
             exit 1
           fi
 
-      - run: python -m pip install --upgrade pip build
-      - run: pip install -e ".[dev,anthropic]"
-      - run: pytest -q
-      - run: python -m build
+      # Wheels only, each pinned with its hash. --no-isolation builds with these
+      # instead of an isolated environment that would install [build-system].requires
+      # unpinned.
+      - name: Install the pinned build dependencies
+        run: python -m pip install --require-hashes --only-binary ':all:' -r .github/requirements-build.txt
+      - run: python -m build --no-isolation
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dist
@@ -44,7 +63,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     environment: release
     permissions:
