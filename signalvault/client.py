@@ -68,18 +68,16 @@ _FLUSH_RETRY_WAIT_SECONDS = 1.0
 _WARN_INTERVAL_SECONDS = 60.0
 _DECISIONS = {"allow", "warn", "block", "redact"}
 _FAIL_MODES = {"open", "closed"}
-# Pre-flight failures where re-sending the ai.request later can succeed.
-_RECORDABLE_CAUSES = {"timeout", "network", "5xx", "invalid-response"}
+# The SignalVault proxy's block answer (/v1/events does not send it). Read in any answer.
+_CONTENT_POLICY_VIOLATION = "content_policy_violation"
 # Pre-flight failures where the server stored the ai.request without a decision (a 429
 # with "recorded": true): over the rule-check rate limit ("429-recorded"), or for a
 # reason a retry would not change (_UNCHECKED_CAUSES, see _unchecked_reason).
 _UNCHECKED_CAUSES = {"429-unscanned-content", "429-scan-timeout", "429-unchecked"}
 _RECORDED_CAUSES = {"429-recorded"} | _UNCHECKED_CAUSES
-# A reason in a 429 with "recorded": true that this version does not know is named in
-# the warning when it looks like a code.
+# A server code is passed on (a 429's "reason" in the warning, an error code in the
+# fallback ai.request's preflight_reason) only when it looks like a code.
 _REASON_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
-# Passed as the fallback when no audit events should be sent at all.
-_NO_AUDIT: Any = object()
 _PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
 _MISSING: Any = object()
 
@@ -171,6 +169,20 @@ class Violation:
     details: Dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _Unchecked:
+    """Why the pre-flight got no decision, and what a call that goes on anyway records. Internal."""
+
+    # The pre-flight's HTTP status; None when there was none.
+    status: Optional[int]
+    # The fallback ai.request's preflight_reason.
+    reason: str
+    # The fallback ai.request leaves out the messages and the metadata.
+    minimal: bool = False
+    # SignalVault stored the request itself (a 429 with "recorded": true): no fallback.
+    recorded: bool = False
+
+
 @dataclass
 class Decision:
     decision: str = "allow"
@@ -180,11 +192,8 @@ class Decision:
     # provider is not modified. Check len(), never truthiness.
     redactions: List[Dict[str, Any]] = field(default_factory=list)
     dashboard_url: Optional[str] = None
-    # Set when no decision was obtained: "record" if the server may not have
-    # stored the request (network, timeout, 5xx, invalid response), "skip" if
-    # it refused it (401/402/403/429/3xx), "recorded" if it stored it without
-    # a decision (a 429 with "recorded": true). Internal.
-    _preflight_failed: Optional[str] = field(default=None, repr=False, compare=False)
+    # Set when no decision was obtained and the call goes on (fail_mode "open"). Internal.
+    _unchecked: Optional[_Unchecked] = field(default=None, repr=False, compare=False)
 
 
 class SignalVaultWarning(UserWarning):
@@ -317,21 +326,78 @@ def _merge_metadata(config_meta: Dict[str, Any], call_meta: Optional[Dict[str, A
     return {**config_meta, **(call_meta or {})}
 
 
-def _parse_decision(data: dict) -> Decision:
+def _parse_violations(items: Any) -> List[Violation]:
     known = Violation.__dataclass_fields__
-    violations = [
+    return [
         Violation(**{k: v for k, v in item.items() if k in known})
-        for item in (data.get("violations") if isinstance(data.get("violations"), list) else [])
+        for item in (items if isinstance(items, list) else [])
         if isinstance(item, dict)
     ]
+
+
+def _parse_decision(data: dict) -> Decision:
     redactions = data.get("redactions")
     dashboard_url = data.get("dashboard_url")
     return Decision(
         decision=data.get("decision", "allow"),
-        violations=violations,
+        violations=_parse_violations(data.get("violations")),
         redactions=redactions if isinstance(redactions, list) else [],
         dashboard_url=dashboard_url if isinstance(dashboard_url, str) else None,
     )
+
+
+def _refusal(status: int, body: Any) -> Optional[Decision]:
+    """A block decision from an answer that is not a 2xx decision, or None.
+
+    ``content_policy_violation`` is the SignalVault proxy's block answer; the
+    events API does not send it. It is read defensively, in any answer and as
+    ``error``, ``error.code`` or ``error.type``, so a refusal is never taken for
+    an outage. A ``block`` decision in a non-2xx answer is a refusal too.
+    """
+    if not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    detail = error if isinstance(error, dict) else {}
+    if _CONTENT_POLICY_VIOLATION not in (error, detail.get("code"), detail.get("type")) and (
+        200 <= status < 300 or body.get("decision") != "block"
+    ):
+        return None
+    violations = detail.get("violations")
+    dashboard_url = detail.get("dashboard_url")
+    if not isinstance(dashboard_url, str):
+        dashboard_url = body.get("dashboard_url")
+    return Decision(
+        decision="block",
+        violations=_parse_violations(violations if isinstance(violations, list) else body.get("violations")),
+        dashboard_url=dashboard_url if isinstance(dashboard_url, str) else None,
+    )
+
+
+def _preflight_reason(status: int, body: Any) -> str:
+    """The fallback ai.request's preflight_reason for a non-2xx pre-flight answer.
+
+    ``redirect`` for a 3xx; else the server's own code, read from ``error``
+    when it is a string, else ``error.code``, else ``error.type``, if it looks
+    like a code; else ``http_<status>``. No other text from the body is used.
+    """
+    if 300 <= status < 400:
+        return "redirect"
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        code = error.get("code")
+        error = code if isinstance(code, str) else error.get("type")
+    if isinstance(error, str) and _REASON_CODE.fullmatch(error):
+        return error
+    return f"http_{status}"
+
+
+def _content_refused(status: int) -> bool:
+    """A 4xx about the request itself (400, 413, 422, any other but 401, 402, 403 and 429).
+
+    The fallback ai.request then leaves out the messages and the metadata:
+    content SignalVault just refused would be refused again, and the record lost.
+    """
+    return 400 <= status < 500 and status not in (401, 402, 403, 429)
 
 
 def _anthropic_messages_for_audit(params: dict) -> list:
@@ -527,15 +593,10 @@ def _unchecked_reason(reason: Any) -> Optional[Tuple[str, str]]:
     return "429-unchecked", f"SignalVault recorded the request unchecked ({code})"
 
 
-def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
-    """Maps a non-2xx pre-flight response to (warning key, human reason)."""
-    try:
-        body = resp.json()
-    except Exception:
-        body = None
+def _describe_failure(status: int, body: Any) -> Tuple[str, str]:
+    """Maps a non-2xx pre-flight answer (status, parsed body) to (warning key, human reason)."""
     error = body.get("error") if isinstance(body, dict) else None
     error_type = error.get("type") if isinstance(error, dict) else error
-    status = resp.status_code
 
     if status == 401:
         return "401", "SignalVault rejected the API key (401: invalid or revoked)"
@@ -560,6 +621,20 @@ def _describe_failure(resp: httpx.Response) -> Tuple[str, str]:
     if status >= 500:
         return "5xx", f"SignalVault API error ({status})"
     return str(status), f"SignalVault rejected the pre-flight check ({status})"
+
+
+class _Fallback:
+    """A fallback ai.request, queued before the provider call. The call's response follows it."""
+
+    __slots__ = ("body", "ref", "sent", "task")
+
+    def __init__(self, body: dict) -> None:
+        self.body = body
+        self.ref = _event_ref(body)
+        # Sync clients: set once it was sent, given up on or dropped.
+        self.sent = threading.Event()
+        # Async clients: the task sending it.
+        self.task: "Optional[asyncio.Task[Any]]" = None
 
 
 class _ClientCommon:
@@ -603,13 +678,10 @@ class _ClientCommon:
             self._last_warned[key] = now
         _emit_warning(message, SignalVaultWarning)
 
-    def _unavailable(
-        self, request_id: str, key: str, reason: str, status: Optional[int] = None,
-    ) -> Decision:
-        """No decision could be obtained: raise in fail_mode 'closed', else warn and allow."""
+    def _unavailable(self, request_id: str, key: str, reason: str, unchecked: _Unchecked) -> Decision:
+        """No decision could be obtained: raise in fail_mode 'closed', else warn and go on unchecked."""
         if self._config.fail_mode == "closed":
-            raise SignalVaultUnavailableError(request_id, reason, status)
-        recorded = key in _RECORDED_CAUSES
+            raise SignalVaultUnavailableError(request_id, reason, unchecked.status)
         if key in _UNCHECKED_CAUSES:
             message = (
                 f"[SignalVault] {reason[0].upper()}{reason[1:]}. Guardrails were NOT applied — it is "
@@ -619,27 +691,57 @@ class _ClientCommon:
             message = (
                 f"[SignalVault] {reason}. Guardrails were NOT applied — requests are being sent "
                 f"to the provider unchecked (fail_mode='open')."
-                + (" They are still recorded in the audit log." if recorded else "")
+                + (" They are still recorded in the audit log." if unchecked.recorded else "")
             )
         self._warn(f"preflight:{key}", message)
-        if recorded:
-            return Decision(_preflight_failed="recorded")
-        return Decision(_preflight_failed="record" if key in _RECORDABLE_CAUSES else "skip")
+        return Decision(_unchecked=unchecked)
 
-    def _fallback_request(self, decision: Decision, request_id: str, params: dict, metadata: dict) -> Any:
-        """What to send before the response when the pre-flight got no decision.
+    def _record_unchecked(
+        self, decision: Decision, request_id: str, params: dict, metadata: dict,
+    ) -> "Optional[_Fallback]":
+        """Queues the fallback ai.request of a call that goes to the provider without a decision.
 
-        None: the server stored the pre-flight, with a decision or (a 429 with
-        ``"recorded": true``) without one. ``_NO_AUDIT``: the server refused
-        it, so a response event would be refused too. Otherwise the ai.request
-        body, so an unchecked call still reaches the audit log.
+        Called before the provider call, so a provider error, or a stream that
+        is never read, still leaves the record. Returns it, for the response
+        event to follow; None when SignalVault answered with a decision or
+        stored the request itself (a 429 with ``"recorded": true``).
         """
-        if decision._preflight_failed in (None, "recorded"):
+        unchecked = decision._unchecked
+        if unchecked is None or unchecked.recorded:
             return None
-        if decision._preflight_failed == "skip":
-            return _NO_AUDIT
-        body = self._preflight_body(request_id, params, metadata)
-        body["payload"]["preflight_unavailable"] = True
+        fallback = _Fallback(self._fallback_body(request_id, params, metadata, unchecked))
+        self._queue_fallback(fallback)
+        return fallback
+
+    def _queue_fallback(self, fallback: "_Fallback") -> None:
+        raise NotImplementedError
+
+    def _fallback_body(self, request_id: str, params: dict, metadata: dict, unchecked: _Unchecked) -> dict:
+        """The ai.request the SDK records for a call it sends to the provider unchecked.
+
+        Marked ``preflight_unavailable``, with the pre-flight's status and
+        reason. The minimal form leaves out the messages and the metadata, and
+        the model unless it is a string.
+        """
+        payload: Dict[str, Any] = {
+            "preflight_unavailable": True,
+            "fail_mode": "open",
+            "preflight_status": unchecked.status,
+            "preflight_reason": unchecked.reason,
+        }
+        if not unchecked.minimal:
+            body = self._preflight_body(request_id, params, metadata)
+            body["payload"] = {**payload, "messages": body["payload"]["messages"]}
+            return body
+        body = {
+            "type": "ai.request",
+            "request_id": request_id,
+            "environment": self._config.environment,
+            "provider": self._provider,
+        }
+        if isinstance(params.get("model"), str):
+            body["model"] = params["model"]
+        body["payload"] = payload
         return body
 
     def _encode_preflight(self, request_id: str, params: dict, metadata: dict) -> Any:
@@ -650,6 +752,7 @@ class _ClientCommon:
             return self._unavailable(
                 request_id, "unserializable",
                 f"The request could not be serialized for SignalVault ({type(exc).__name__}: {exc})",
+                _Unchecked(None, "unserializable", minimal=True),
             )
 
     def _encode_event(self, event: dict) -> Optional[bytes]:
@@ -683,16 +786,31 @@ class _ClientCommon:
         }
 
     def _interpret_preflight(self, request_id: str, resp: httpx.Response) -> Decision:
-        if not 200 <= resp.status_code < 300:
-            key, reason = _describe_failure(resp)
-            return self._unavailable(request_id, key, reason, resp.status_code)
+        status = resp.status_code
         try:
             data = resp.json()
-        except ValueError:
-            return self._unavailable(request_id, "invalid-response", "SignalVault returned an invalid response")
+        except Exception:
+            data = _MISSING
+        refusal = _refusal(status, data)
+        if refusal is not None:
+            return refusal  # in either fail mode
+        if not 200 <= status < 300:
+            key, reason = _describe_failure(status, data)
+            return self._unavailable(request_id, key, reason, _Unchecked(
+                status, _preflight_reason(status, data),
+                minimal=_content_refused(status), recorded=key in _RECORDED_CAUSES,
+            ))
+        if data is _MISSING:
+            return self._unavailable(
+                request_id, "invalid-response", "SignalVault returned an invalid response",
+                _Unchecked(status, "invalid_response"),
+            )
         decision = data.get("decision") if isinstance(data, dict) else None
         if not isinstance(decision, str) or decision not in _DECISIONS:
-            return self._unavailable(request_id, "invalid-response", "SignalVault returned an invalid decision")
+            return self._unavailable(
+                request_id, "invalid-response", "SignalVault returned an invalid decision",
+                _Unchecked(status, "invalid_response"),
+            )
         return _parse_decision(data)
 
     def _enforce(self, request_id: str, decision: Decision) -> None:
@@ -843,8 +961,11 @@ class _BaseSyncClient(_ClientCommon):
         self._init_common(config)
         # Never follow redirects: the API key must not be re-sent to another URL.
         self._http = httpx.Client(follow_redirects=False)
-        # Audit sends waiting for a delivery thread: (fn, args, the events it sends).
-        self._queue: Deque[Tuple[Callable[..., Any], tuple, List[str]]] = collections.deque()
+        # Audit sends waiting for a delivery thread: (fn, args, the events it sends,
+        # an Event set once it has run or was dropped).
+        self._queue: Deque[Tuple[Callable[..., Any], tuple, List[str], Optional[threading.Event]]] = (
+            collections.deque()
+        )
         self._queue_cond = threading.Condition()
         self._queued_events = 0
         self._workers = 0  # delivery threads running
@@ -888,23 +1009,32 @@ class _BaseSyncClient(_ClientCommon):
 
     # -- Delivery queue ------------------------------------------------------
 
-    def _submit(self, fn: Callable[..., Any], *args: Any, refs: Optional[List[str]] = None) -> None:
+    def _submit(
+        self, fn: Callable[..., Any], *args: Any,
+        refs: Optional[List[str]] = None, done: Optional[threading.Event] = None,
+    ) -> None:
         """Queues ``fn(*args)``, which sends the events ``refs`` names, for a delivery thread.
 
-        When more than ``_MAX_QUEUED_EVENTS`` are waiting, the oldest are dropped.
+        When more than ``_MAX_QUEUED_EVENTS`` are waiting, the oldest are
+        dropped. ``done`` is set once ``fn`` has run or was dropped.
         """
         refs = refs if refs is not None else [f"{getattr(fn, '__name__', 'send')} (no event_id)"]
         with self._queue_cond:
             closed = self._closing
             dropped: List[str] = []
             start = False
-            if not closed:
-                self._queue.append((fn, args, refs))
+            if closed:
+                if done is not None:
+                    done.set()
+            else:
+                self._queue.append((fn, args, refs, done))
                 self._queued_events += len(refs)
                 while self._queued_events > _MAX_QUEUED_EVENTS and len(self._queue) > 1:
-                    _, _, oldest = self._queue.popleft()
+                    _, _, oldest, oldest_done = self._queue.popleft()
                     self._queued_events -= len(oldest)
                     dropped.extend(oldest)
+                    if oldest_done is not None:
+                        oldest_done.set()
                 # One more thread if every running one is busy, up to _DELIVERY_WORKERS.
                 start = self._workers < _DELIVERY_WORKERS and self._workers - self._busy < len(self._queue)
                 if start:
@@ -939,7 +1069,7 @@ class _BaseSyncClient(_ClientCommon):
                     self._workers -= 1
                     self._queue_cond.notify_all()
                     return
-                fn, args, refs = self._queue.popleft()
+                fn, args, refs, done = self._queue.popleft()
                 self._queued_events -= len(refs)
                 self._busy += 1
                 with self._refs_lock:
@@ -950,6 +1080,8 @@ class _BaseSyncClient(_ClientCommon):
                 if self._config.debug:
                     traceback.print_exc()
             finally:
+                if done is not None:
+                    done.set()
                 # Normally each event was settled as it finished; what's left was stopped by an error.
                 left = self._claim_unsent(refs, sender_may_continue=False)
                 if left:
@@ -1007,7 +1139,10 @@ class _BaseSyncClient(_ClientCommon):
         with self._queue_cond:
             if self._closing:
                 return
-            queued = [ref for _, _, refs in self._queue for ref in refs]
+            queued = [ref for _, _, refs, _ in self._queue for ref in refs]
+            for _, _, _, done in self._queue:
+                if done is not None:
+                    done.set()
             self._queue.clear()
             self._queued_events = 0
             # A sender that finishes later must not report these again.
@@ -1098,36 +1233,42 @@ class _BaseSyncClient(_ClientCommon):
             return self._unavailable(
                 request_id, "timeout",
                 f"SignalVault pre-flight check timed out after {self._config.preflight_timeout}s",
+                _Unchecked(None, "timeout"),
             )
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
-            return self._unavailable(request_id, "network", "SignalVault API is unreachable")
+            return self._unavailable(
+                request_id, "network", "SignalVault API is unreachable", _Unchecked(None, "network"),
+            )
         return self._interpret_preflight(request_id, resp)
+
+    def _queue_fallback(self, fallback: _Fallback) -> None:
+        self._submit(self._send_fallback, fallback, refs=[fallback.ref], done=fallback.sent)
+
+    def _send_fallback(self, fallback: _Fallback) -> None:
+        self._post_background(fallback.body, event_id=False)
 
     def _fire_response(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Optional[_Fallback] = None,
     ) -> None:
-        """Queues the response event (after the fallback ai.request, if any). Does not block the caller."""
-        if fallback is _NO_AUDIT:
-            return
+        """Queues the response event, sent after the fallback ai.request, if any. Does not block the caller."""
         event_id = str(uuid.uuid4())
         self._submit(
             self._send_response_from_parts,
             request_id, model, output, usage, metadata, fallback, event_id,
-            refs=([_event_ref(fallback)] if fallback is not None else []) + [f"event_id={event_id}"],
+            refs=[f"event_id={event_id}"],
         )
 
     def _send_response_from_parts(
-        self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None, event_id: Optional[str] = None,
+        self, request_id: str, model: str, output: str, usage: Dict[str, Any],
+        metadata: dict, fallback: Optional[_Fallback] = None, event_id: Optional[str] = None,
     ) -> None:
-        if fallback is _NO_AUDIT:
-            return
         if fallback is not None:
-            # Must land first: the server rejects an ai.response whose ai.request it has not stored.
-            self._post_background(fallback, event_id=False)
+            # The server rejects an ai.response whose ai.request it has not stored. The
+            # fallback was queued first, so a delivery thread already has it, or it was dropped.
+            fallback.sent.wait()
         self._post_background(_event_with_id(
             self._response_body(request_id, model, output, usage, metadata), event_id,
         ))
@@ -1409,6 +1550,10 @@ class _BaseAsyncClient(_ClientCommon):
         # tasks, so an unreferenced audit task can be garbage-collected mid-send.
         self._tasks: Dict["asyncio.Task[Any]", List[str]] = {}
         self._queued_events = 0
+        # Fallback ai.requests not sent, given up on or reported dropped yet, by ref.
+        # One whose task was cancelled from outside (usually the event loop
+        # stopping) stays here: the call's response sends it first.
+        self._fallbacks: Dict[str, _Fallback] = {}
         self._closed = False
         # flush() or aclose() in progress: retries wait less.
         self._hurrying = 0
@@ -1441,6 +1586,9 @@ class _BaseAsyncClient(_ClientCommon):
         dropped: List[str] = []
         for task in pending:
             dropped += self._cancel(task)
+        # Fallback requests cut off with no response to send them since.
+        dropped += self._claim_unsent(list(self._fallbacks), sender_may_continue=False)
+        self._fallbacks.clear()
         self._drop("shutdown", dropped, "the client was closed before they were sent")
         await self._http.aclose()
 
@@ -1508,21 +1656,27 @@ class _BaseAsyncClient(_ClientCommon):
         refs = self._tasks.pop(task, [])
         self._queued_events -= len(refs)
         task.cancel()
-        return self._claim_unsent(refs, sender_may_continue=False)
+        claimed = self._claim_unsent(refs, sender_may_continue=False)
+        for ref in claimed:
+            self._fallbacks.pop(ref, None)  # reported: the response won't send it
+        return claimed
 
     def _task_done(self, task: "asyncio.Task[Any]") -> None:
         refs = self._tasks.pop(task, None)
         if refs is None:  # cancelled by _cancel, which reported it
             return
         self._queued_events -= len(refs)
-        left = self._claim_unsent(refs, sender_may_continue=False)
         if task.cancelled():
+            # A fallback ai.request stays unsent: its response sends it, or
+            # aclose() or the exit reports it.
+            left = self._claim_unsent([r for r in refs if r not in self._fallbacks], sender_may_continue=False)
             self._drop(
                 "shutdown", left,
                 "the task sending them was cancelled, usually because the event loop stopped; "
                 "await client.aclose() before it ends",
             )
             return
+        left = self._claim_unsent(refs, sender_may_continue=False)
         if task.exception() is not None and self._config.debug:
             exc = task.exception()
             traceback.print_exception(type(exc), exc, exc.__traceback__)
@@ -1614,37 +1768,52 @@ class _BaseAsyncClient(_ClientCommon):
             return self._unavailable(
                 request_id, "timeout",
                 f"SignalVault pre-flight check timed out after {self._config.preflight_timeout}s",
+                _Unchecked(None, "timeout"),
             )
         except httpx.HTTPError:
             if self._config.debug:
                 traceback.print_exc()
-            return self._unavailable(request_id, "network", "SignalVault API is unreachable")
+            return self._unavailable(
+                request_id, "network", "SignalVault API is unreachable", _Unchecked(None, "network"),
+            )
         return self._interpret_preflight(request_id, resp)
+
+    def _queue_fallback(self, fallback: _Fallback) -> None:
+        fallback.task = self._spawn(self._send_fallback(fallback), refs=[fallback.ref])
+        if fallback.task is not None:
+            self._fallbacks[fallback.ref] = fallback
+
+    async def _send_fallback(self, fallback: _Fallback) -> None:
+        await self._post_background(fallback.body, event_id=False)
+        self._fallbacks.pop(fallback.ref, None)
 
     def _fire_response(
         self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None,
+        usage: Dict[str, Any], metadata: dict, fallback: Optional[_Fallback] = None,
     ) -> "Optional[asyncio.Task[Any]]":
-        """Sends the response event (after the fallback ai.request, if any) in the background."""
-        if fallback is _NO_AUDIT:
-            return None
+        """Sends the response event, after the fallback ai.request if any, in the background."""
         event_id = str(uuid.uuid4())
+        refs = [f"event_id={event_id}"]
+        if fallback is not None and fallback.ref in self._fallbacks:
+            refs.insert(0, fallback.ref)  # not sent yet: this task may have to send it
         return self._spawn(
             self._send_response_from_parts(
                 request_id, model, output, usage, metadata, fallback=fallback, event_id=event_id,
             ),
-            refs=([_event_ref(fallback)] if fallback is not None else []) + [f"event_id={event_id}"],
+            refs=refs,
         )
 
     async def _send_response_from_parts(
-        self, request_id: str, model: str, output: str,
-        usage: Dict[str, Any], metadata: dict, fallback: Any = None, event_id: Optional[str] = None,
+        self, request_id: str, model: str, output: str, usage: Dict[str, Any],
+        metadata: dict, fallback: Optional[_Fallback] = None, event_id: Optional[str] = None,
     ) -> None:
-        if fallback is _NO_AUDIT:
-            return
         if fallback is not None:
-            # Must land first: the server rejects an ai.response whose ai.request it has not stored.
-            await self._post_background(fallback, event_id=False)
+            # The server rejects an ai.response whose ai.request it has not stored.
+            if fallback.task is not None and not fallback.task.done():
+                await asyncio.wait([fallback.task])
+            if self._fallbacks.pop(fallback.ref, None) is not None:
+                # Its task was cancelled first, usually by the event loop stopping.
+                await self._post_background(fallback.body, event_id=False)
         await self._post_background(_event_with_id(
             self._response_body(request_id, model, output, usage, metadata), event_id,
         ))
@@ -2132,7 +2301,7 @@ class _ChatCompletions:
         decision = self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
-        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
+        fallback = self._sv._record_unchecked(decision, request_id, kwargs, metadata)
 
         hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
@@ -2282,7 +2451,7 @@ class _AsyncChatCompletions:
         decision = await self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
-        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
+        fallback = self._sv._record_unchecked(decision, request_id, kwargs, metadata)
 
         hide_usage_chunk = _with_stream_usage(kwargs, stream)
 
@@ -2428,7 +2597,7 @@ class _AnthropicMessages:
         decision = self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
-        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
+        fallback = self._sv._record_unchecked(decision, request_id, kwargs, metadata)
 
         response = self._sv._anthropic.messages.create(**kwargs)
 
@@ -2574,7 +2743,7 @@ class _AsyncAnthropicMessages:
         decision = await self._sv._send_request(request_id, kwargs, metadata)
 
         self._sv._enforce(request_id, decision)
-        fallback = self._sv._fallback_request(decision, request_id, kwargs, metadata)
+        fallback = self._sv._record_unchecked(decision, request_id, kwargs, metadata)
 
         response = await self._sv._anthropic.messages.create(**kwargs)
 

@@ -227,10 +227,18 @@ response = client.chat.completions.create(
 
 ## When SignalVault Is Unavailable
 
-The pre-flight guardrail check is in your request's critical path. If it cannot return a decision — timeout, network error, invalid or revoked API key (401), inactive subscription (402), access denied (403), rate or trial limit (429), a request SignalVault records unchecked (429, below), server error, an invalid response, or a request that can't be serialized (for example a circular reference in `sv_metadata`) — `fail_mode` decides what happens:
+The pre-flight guardrail check is in your request's critical path. What the SDK does with its answer, by `fail_mode`:
 
-- `"open"` (default): the request goes to the provider **without** guardrails, and the SDK emits a `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). If SignalVault was unreachable, timed out or errored, the request is still recorded in the background, marked `preflight_unavailable`, so it appears in your audit log.
-- `"closed"`: the SDK raises `SignalVaultUnavailableError` and the provider is never called. Use this if every request must be checked.
+| Pre-flight answer | `"open"` (default) | `"closed"` |
+|---|---|---|
+| 2xx, `decision` allow / warn / redact | Provider called. SignalVault stored the request with its decision; the response is recorded. | Same |
+| 2xx, `decision: "block"` | Provider **not** called. `SignalVaultBlockedError`. | Same |
+| Any status whose body says `content_policy_violation` (`error`, `error.code` or `error.type`), or any non-2xx body with `decision: "block"` | Provider **not** called. `SignalVaultBlockedError` (violations and dashboard URL from the body when present). | Same |
+| `429` with `"recorded": true` (rule-check rate limit, `scan_timeout`, `unscanned_content`, any other reason) | Provider called. SignalVault already stored the request unchecked; the SDK sends no second record; the response is recorded. The `SignalVaultWarning` names the reason. | `SignalVaultUnavailableError`; provider not called. |
+| Everything else: network error, timeout, 3xx, 400, 401, 402, 403, 404 and any other 4xx, 413, 422, 429 without `"recorded": true` (trial limit, general rate limit), 5xx, a 2xx that is not valid JSON or has no valid `decision` | Provider called. `SignalVaultWarning` (at most once a minute per cause, whether or not `debug` is on). **The SDK records the request itself**: a fallback `ai.request` marked unchecked, with status and reason, on the background queue. The response is recorded after it. | `SignalVaultUnavailableError` with the status; provider not called. |
+| The request could not be serialized for the check (for example a circular reference in `sv_metadata`) | Provider called. Fallback record as above, minimal form, reason `unserializable`, status `null`. | `SignalVaultUnavailableError`; provider not called. |
+
+The fallback `ai.request` has the call's `request_id` and is marked `preflight_unavailable`, with `preflight_status` (the HTTP status, or `null` when there was none) and `preflight_reason` (`timeout`, `network`, `redirect`, `invalid_response`, `unserializable`, SignalVault's own error code, or `http_<status>`). It is sent as soon as the call goes ahead, before the provider call, so a provider error or a stream that is never read still leaves it, and it is retried on the background queue like any audit event. After a 400, 413, 422 or another 4xx about the request, and for a request that can't be serialized, it is in its minimal form: without the messages and `sv_metadata`, which SignalVault would refuse again. With a key SignalVault refuses (401, 402, 403, or the trial limit), it refuses the record too: after a 401, 402 or 403 the record is not retried (with `debug=True` the SDK warns `Event not delivered`), and after the trial limit it is retried, then logged as dropped.
 
 The pre-flight check tells SignalVault which `fail_mode` the client uses, so the audit log shows whether a request that could not be checked went to the provider. `fail_mode` applies to the pre-flight check, so it has no effect in mirror mode.
 
@@ -268,7 +276,7 @@ client = SignalVaultClient(
 
 ### Background delivery
 
-Audit events (responses, mirror-mode events, tool calls) are queued in memory and sent in the background, without blocking your call:
+Audit events (the fallback `ai.request`, responses, mirror-mode events, tool calls) are queued in memory and sent in the background, without blocking your call:
 
 - **Retries.** An event that fails with a connection error, a timeout, a 5xx or a 429 is retried with exponential backoff: up to 6 attempts over about two minutes (waits of about 4, 8, 16, 32 and 60 seconds). A 429's `Retry-After` is honoured, up to 60 seconds. Other 4xx responses mean the event was rejected, and it is not retried. A 429 with `"recorded": true` is not retried either: SignalVault has stored the request, unchecked, and would answer a retry the same way, so it counts as delivered and its response is sent. Each event carries an `event_id`, so a retry is never double-counted. `tools.record()` makes the first attempt itself; if that one can be retried, the rest happen in the background.
 - **Queue.** Up to 1,000 events per client wait to be sent. When the queue is full, the oldest are dropped to make room.
@@ -292,7 +300,7 @@ Every drop is logged on the `signalvault` logger at `WARNING`, one record per oc
 SignalVault dropped 1 audit event(s), every attempt failed (6 attempts, last: rate limited, 429): event_id=4f6c...
 ```
 
-A fallback `ai.request` (sent when the pre-flight check got no answer) has no `event_id`, so it is logged by its `request_id`, marked as such. The record also carries the cause and the ids as `record.signalvault_drop_cause` and `record.signalvault_dropped`. If your app doesn't configure `logging`, Python prints these records to stderr. The SDK also emits a `SignalVaultWarning`, at most once a minute per cause; the log has every drop.
+A fallback `ai.request` (the SDK's record of a request sent without a decision) has no `event_id`, so it is logged by its `request_id`, marked as such. The record also carries the cause and the ids as `record.signalvault_drop_cause` and `record.signalvault_dropped`. If your app doesn't configure `logging`, Python prints these records to stderr. The SDK also emits a `SignalVaultWarning`, at most once a minute per cause; the log has every drop.
 
 `client.dropped_events` counts what a client has dropped, by cause. It is a read-only snapshot, on sync and async clients:
 
@@ -385,7 +393,7 @@ client = SignalVaultClient(
 
 ## Features
 
-- **Automatic Logging** — Every request and response is recorded
+- **Automatic Logging** — Requests and responses are recorded, including requests sent to the provider without a guardrail decision
 - **Pre-flight Guardrails** — Block requests that break your rules before they reach the AI provider
 - **Redaction at rest** — Rules with the `redact` action remove matches from what SignalVault stores. The request sent to the AI provider is **not** modified.
 - **PII Detection** — Detect emails, phone numbers, SSNs
