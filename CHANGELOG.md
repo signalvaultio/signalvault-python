@@ -7,7 +7,9 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
-## [Unreleased]
+## [0.7.1] — unreleased
+
+A refusal from SignalVault never reaches the provider, the SDK sends a record of every call that goes ahead without a decision, warnings name why a request was recorded unchecked, and a `base_url` with credentials is refused.
 
 ### Security
 
