@@ -298,7 +298,12 @@ class TestPreflightFailures:
             warnings.simplefilter("always")
             for _ in range(3):
                 client.chat.completions.create(model="m", messages=MESSAGES)
-        assert len([w for w in caught if issubclass(w.category, SignalVaultWarning)]) == 1
+            client.flush()
+        messages = [str(w.message) for w in caught if issubclass(w.category, SignalVaultWarning)]
+        # One for the pre-flight check, and one (once per process) for the refused records.
+        assert len([m for m in messages if "rejected the API key" in m]) == 1
+        assert len([m for m in messages if "refused an audit event (401)" in m]) == 1
+        assert len(messages) == 2
 
     def test_fail_closed_raises_and_skips_provider(self):
         server = Server({"ai.request": [{"status": 401, "json": {}}]})

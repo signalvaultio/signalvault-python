@@ -84,6 +84,17 @@ _MISSING: Any = object()
 # Every dropped audit event is logged here, with its event_id, at WARNING.
 logger = logging.getLogger("signalvault")
 
+# An audit event refused with one of these means SignalVault refuses the key's
+# events: what the warning tells the user to check.
+_REFUSED_KEY_FIX = {
+    401: "Check the API key at signalvault.io.",
+    402: "Check the account at signalvault.io.",
+    403: "Check the key's environment and account at signalvault.io.",
+}
+# The statuses above already warned about, once per process across all clients.
+_REFUSED_WARNED: set = set()
+_REFUSED_LOCK = threading.Lock()
+
 
 def _emit_warning(message: str, category: type = UserWarning) -> None:
     """Warns from the first stack frame outside this package, every time.
@@ -384,22 +395,38 @@ def _refusal(status: int, body: Any) -> Optional[Decision]:
     )
 
 
-def _preflight_reason(status: int, body: Any) -> str:
-    """The fallback ai.request's preflight_reason for a non-2xx pre-flight answer.
+def _server_code(body: Any) -> Optional[str]:
+    """SignalVault's own code in an answer's body, or None.
 
-    ``redirect`` for a 3xx; else the server's own code, read from ``error``
-    when it is a string, else ``error.code``, else ``error.type``, if it looks
-    like a code; else ``http_<status>``. No other text from the body is used.
+    Read from ``error`` when it is a string, else ``error.code``, else
+    ``error.type``, and used only if it looks like a code
+    (``[a-z][a-z0-9_]{0,63}``). No other text from a body reaches a message,
+    a warning, a log line or an audit event.
     """
-    if 300 <= status < 400:
-        return "redirect"
     error = body.get("error") if isinstance(body, dict) else None
     if isinstance(error, dict):
         code = error.get("code")
         error = code if isinstance(code, str) else error.get("type")
     if isinstance(error, str) and _REASON_CODE.fullmatch(error):
         return error
-    return f"http_{status}"
+    return None
+
+
+def _status_label(status: int, body: Any) -> str:
+    """``"<status>: <code>"`` when the body gives a code (``_server_code``), else ``"<status>"``."""
+    code = _server_code(body)
+    return f"{status}: {code}" if code else str(status)
+
+
+def _preflight_reason(status: int, body: Any) -> str:
+    """The fallback ai.request's preflight_reason for a non-2xx pre-flight answer.
+
+    ``redirect`` for a 3xx; else the server's own code (``_server_code``);
+    else ``http_<status>``.
+    """
+    if 300 <= status < 400:
+        return "redirect"
+    return _server_code(body) or f"http_{status}"
 
 
 def _content_refused(status: int) -> bool:
@@ -571,6 +598,32 @@ def _retry_delay(resp: Optional[httpx.Response], attempt: int, rand: Callable[[]
             return min(retry_after, _MAX_RETRY_DELAY_SECONDS)
     backoff = _BACKOFF_BASE_SECONDS * 2 ** (attempt - 1) * (0.8 + 0.4 * rand())
     return min(backoff, _MAX_RETRY_DELAY_SECONDS)
+
+
+def _warn_refused_event(resp: httpx.Response) -> None:
+    """Warns that SignalVault refused an audit event with 401, 402 or 403, once per process per status.
+
+    SignalVault then refuses every event from the key, so requests go
+    unrecorded until it is fixed. Not gated on debug, and logged on the
+    ``signalvault`` logger at WARNING like a drop, which a warnings filter does
+    not silence and which reaches stderr with no logging configured; also
+    emitted as a SignalVaultWarning, as a drop is.
+    """
+    status = resp.status_code
+    with _REFUSED_LOCK:
+        if status in _REFUSED_WARNED:
+            return
+        _REFUSED_WARNED.add(status)
+    try:
+        body = resp.json()
+    except Exception:
+        body = None
+    message = (
+        f"[SignalVault] SignalVault refused an audit event ({_status_label(status, body)}): "
+        f"requests are not being recorded. {_REFUSED_KEY_FIX[status]}"
+    )
+    logger.warning(message, extra={"signalvault_refused_status": status})
+    _emit_warning(message, SignalVaultWarning)
 
 
 def _undelivered_cause(resp: Optional[httpx.Response]) -> str:
@@ -862,7 +915,11 @@ class _ClientCommon:
         }
 
     def _log_undelivered(self, resp: Optional[httpx.Response], attempts: int, ref: str) -> None:
-        """Reports the outcome of an event's last attempt: a drop always, a rejection only with debug."""
+        """Reports the outcome of an event's last attempt.
+
+        A drop always; a refusal of the key (401, 402, 403) once per process
+        (``_warn_refused_event``); any other refusal only with debug.
+        """
         if not self._settle(ref):
             return  # already reported as dropped at shutdown
         if resp is not None and (200 <= resp.status_code < 300 or _recorded(resp)):
@@ -872,7 +929,10 @@ class _ClientCommon:
                 "retries_exhausted", [ref],
                 f"{attempts} attempt{'s' if attempts != 1 else ''}, last: {_undelivered_cause(resp)}",
             )
-        elif self._config.debug:
+            return
+        if resp.status_code in _REFUSED_KEY_FIX:
+            _warn_refused_event(resp)
+        if self._config.debug:
             _emit_warning(f"[SignalVault] Event not delivered: {resp.status_code}", SignalVaultWarning)
 
     @property

@@ -9,7 +9,7 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [0.7.1] — unreleased
 
-A refusal from SignalVault never reaches the provider, the SDK sends a record of every call that goes ahead without a decision, warnings name why a request was recorded unchecked, and a `base_url` with credentials is refused.
+A refusal from SignalVault never reaches the provider, the SDK sends a record of every call that goes ahead without a decision, warnings name why a request was recorded unchecked, an audit event refused with the key warns without `debug`, and a `base_url` with credentials is refused.
 
 ### Security
 
@@ -22,6 +22,7 @@ A refusal from SignalVault never reaches the provider, the SDK sends a record of
 - With `fail_mode="open"`, the SDK sends a record of every call that goes to the provider without a decision. Unless SignalVault stored the request itself (a 429 with `"recorded": true`), the SDK sends its own `ai.request` for the call, marked `preflight_unavailable`, with `payload.preflight_status` (the HTTP status, or `null` when there was none) and `payload.preflight_reason` (`timeout`, `network`, `redirect`, `invalid_response`, `unserializable`, SignalVault's own error code when it looks like one, or `http_<status>`). **Note:** this now covers a 3xx, 401, 402, 403, a 429 without `"recorded": true` (the trial limit, the general rate limit), 400, 413, 422 and every other 4xx, and a request that can't be serialized, after which nothing was recorded. After a 400, 413, 422 or another 4xx about the request, and for a request that can't be serialized, the record leaves out the messages and the metadata (and the model, unless it is a string), since SignalVault would refuse them again. With a key SignalVault refuses (401, 402, 403, the trial limit), it refuses the record too. For a request that can't be serialized the response event is attempted as well; it carries the same metadata, so it is dropped, logged and counted as `unserializable`.
 - The fallback `ai.request` is queued as soon as the call goes ahead, before the provider call, instead of with the response. **Note:** it is sent even when the provider call raises or a stream is never read; the response event still goes after it.
 - `SignalVaultUnavailableError.status` is the HTTP status for a 2xx answer that is not valid JSON or has no valid `decision` (it was `None`).
+- An audit event SignalVault refuses with 401, 402 or 403 (the fallback `ai.request`, a response, a tool call or a mirror-mode request) warns without `debug`, once per process for each status: SignalVault refuses every event from that key, so requests are not being recorded. The warning is logged on the `signalvault` logger at `WARNING`, which a `warnings` filter does not silence and which reaches stderr when logging is not configured, and emitted as a `SignalVaultWarning`, for example "[SignalVault] SignalVault refused an audit event (401): requests are not being recorded. Check the API key at signalvault.io." After a 402 it says to check the account, after a 403 the key's environment and account. **Note:** before, only `debug=True` showed these, as "Event not delivered", which it still adds.
 
 ### Fixes
 
