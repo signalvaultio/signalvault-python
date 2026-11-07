@@ -248,6 +248,8 @@ The fallback `ai.request` has the call's `request_id` and is marked `preflight_u
 
 After a 402 it says to check the account, and after a 403 the key's environment and account. An event refused for its content (400, 422) warns only with `debug=True` (`Event not delivered`).
 
+**No server text in messages.** A warning, an error or a log line never quotes text from SignalVault's answer. It gives the HTTP status and, when the answer carries one, SignalVault's code, such as `(402: subscription_inactive)` or `(403: environment_not_allowed)`; anything else gives the bare status, such as `(403)`. `SignalVaultBlockedError` and the `debug=True` warning for a `warn` decision name the violations' types (`contains_pii`, `keyword_blocklist`...); the violations themselves are on the error's `violations`, and SignalVault stores them with the request.
+
 The pre-flight check tells SignalVault which `fail_mode` the client uses, so the audit log shows whether a request that could not be checked went to the provider. `fail_mode` applies to the pre-flight check, so it has no effect in mirror mode.
 
 **Rate limit.** Rule checks are limited to 120 requests per minute per app. Above that, SignalVault still records the request, without running your rules, and answers 429:
