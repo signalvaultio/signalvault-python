@@ -234,7 +234,8 @@ class TestPreflightFailures:
         client._openai.chat.completions.create.assert_called_once()
 
     def test_warns_once_per_minute_per_cause(self):
-        server = Server({"ai.request": [{"status": 401, "json": {}} for _ in range(3)]})
+        # Three pre-flights, and the SDK's record of each, refused with the key.
+        server = Server({"ai.request": [{"status": 401, "json": {}} for _ in range(6)]})
         client = sync_client(server)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -528,14 +529,22 @@ class TestUnserializableRequest:
         loop["self"] = loop
         return {"loop": loop}
 
-    def test_fail_open_warns_and_calls_the_provider(self):
+    def test_fail_open_warns_calls_the_provider_and_records_the_request_without_its_content(self):
         server = Server()
         client = sync_client(server)
         with pytest.warns(SignalVaultWarning, match="could not be serialized"):
             client.chat.completions.create(model="m", messages=MESSAGES, sv_metadata=self._cyclic_metadata())
-        client.flush()
+            client.flush()
         assert client._openai.chat.completions.create.called
-        assert server.requests == []
+        # The response carries the same metadata, so it can't be sent either: dropped and counted.
+        assert server.types() == ["ai.request"]
+        assert client.dropped_events == signalvault.DroppedEvents(unserializable=1)
+        fallback = server.bodies[0]
+        assert "metadata" not in fallback
+        assert fallback["payload"] == {
+            "preflight_unavailable": True, "fail_mode": "open",
+            "preflight_status": None, "preflight_reason": "unserializable",
+        }
 
     def test_fail_closed_raises(self):
         server = Server()
@@ -1182,22 +1191,27 @@ class TestAuditWhenPreflightFailed:
         fallback = server.bodies[1]
         assert fallback["request_id"] == server.bodies[0]["request_id"]
         assert "event_id" not in fallback
-        assert fallback["payload"] == {"messages": MESSAGES, "fail_mode": "open", "preflight_unavailable": True}
+        assert fallback["payload"] == {
+            "messages": MESSAGES, "fail_mode": "open", "preflight_unavailable": True,
+            "preflight_status": 503, "preflight_reason": "http_503",
+        }
 
-    @pytest.mark.parametrize("status,body", [
-        (401, {}),
+    @pytest.mark.parametrize("status,body,reason", [
+        (401, {}, "http_401"),
         # A 429 without "recorded": true: the trial limit, or the ingest ceiling.
-        (429, {"error": "rate_limited"}),
-        (429, {"error": {"type": "trial_limit_exceeded"}}),
-        (429, {"error": "rate_limited", "recorded": False}),
+        (429, {"error": "rate_limited"}, "rate_limited"),
+        (429, {"error": {"type": "trial_limit_exceeded"}}, "trial_limit_exceeded"),
+        (429, {"error": "rate_limited", "recorded": False}, "rate_limited"),
     ])
-    def test_no_audit_events_after_a_refused_preflight(self, status, body):
+    def test_a_refused_preflight_is_still_recorded_by_the_sdk(self, status, body, reason):
         server = Server({"ai.request": [{"status": status, "json": body}]})
         client = sync_client(server)
         with pytest.warns(SignalVaultWarning):
             client.chat.completions.create(model="m", messages=MESSAGES)
         client.flush()
-        assert server.types() == ["ai.request"]
+        assert server.types() == ["ai.request", "ai.request", "ai.response"]
+        assert server.bodies[1]["payload"]["preflight_status"] == status
+        assert server.bodies[1]["payload"]["preflight_reason"] == reason
 
     @pytest.mark.asyncio
     async def test_async_records_the_request_on_network_error(self):
