@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+import traceback
 import warnings
 from typing import Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -127,6 +128,41 @@ class TestBaseUrl:
             with pytest.raises(ValueError):
                 normalize_base_url(bad)
 
+    @pytest.mark.parametrize("bad", [
+        "https://alice:SECRET@api.signalvault.io",
+        "https://SECRET@api.signalvault.io",
+        "https://:SECRET@api.signalvault.io",
+        "https://@api.signalvault.io",
+        "http://alice:SECRET@127.0.0.1:4000",
+        "ftp://alice:SECRET@api.signalvault.io",
+    ])
+    def test_refuses_credentials(self, bad):
+        # httpx would send them as Basic auth in place of the API key.
+        with pytest.raises(ValueError) as exc:
+            SignalVaultClient(api_key="k", openai_api_key="x", base_url=bad)
+        assert str(exc.value) == (
+            "[SignalVault] base_url must not contain credentials (user:password@). Pass the key as api_key."
+        )
+
+    @pytest.mark.parametrize("bad", [
+        "https://alice:SECRET@api.signalvault.io",
+        "https://api.signalvault.io/?token=SECRET",
+        "https://api.signalvault.io/#SECRET",
+        "http://api.signalvault.io/SECRET",
+        "ftp://api.signalvault.io/SECRET",
+        "alice:SECRET@api.signalvault.io",
+        "SECRET",
+        "https://[SECRET",
+    ])
+    def test_errors_never_quote_the_url(self, bad):
+        with pytest.raises(ValueError) as exc:
+            normalize_base_url(bad)
+        assert str(exc.value).startswith("[SignalVault] base_url ")
+        assert "SECRET" not in str(exc.value) and "SECRET" not in repr(exc.value)
+        assert exc.value.__cause__ is None
+        if exc.value.__context__ is not None:  # urlparse's own error, hidden from the traceback
+            assert exc.value.__suppress_context__ and "SECRET" not in str(exc.value.__context__)
+
     def test_rejects_unknown_fail_mode(self):
         with pytest.raises(ValueError, match="fail_mode"):
             SignalVaultClient(api_key="k", openai_api_key="x", fail_mode="maybe")
@@ -185,6 +221,27 @@ class TestApiKey:
     def test_non_string_key_is_a_type_error(self):
         with pytest.raises(TypeError, match="NoneType"):
             SignalVaultClient(api_key=None, openai_api_key="sk-fake")
+
+    @pytest.mark.parametrize("index", range(4))
+    def test_the_key_is_not_in_the_config_or_client_repr(self, index):
+        cls = ([SignalVaultClient, AsyncSignalVaultClient] + anthropic_classes())[index]
+        client = build_any(cls, "sk_live_" + "REPRSECRET")
+        assert client._config.api_key == "sk_live_REPRSECRET"
+        assert "REPRSECRET" not in repr(client._config)
+        assert "REPRSECRET" not in repr(vars(client))
+
+    def test_the_key_is_not_in_the_locals_of_a_constructor_traceback(self):
+        # traceback, rich, pytest --showlocals and error trackers show frame locals with repr().
+        with patch("signalvault.client.httpx.Client", side_effect=RuntimeError("no connection pool")):
+            with pytest.raises(RuntimeError) as info:
+                SignalVaultClient(api_key="sk_live_" + "TBSECRET", openai_api_key="sk-fake")
+        tb = traceback.TracebackException(info.type, info.value, info.tb, capture_locals=True)
+        assert any("config" in (f.locals or {}) for f in tb.stack)  # _BaseSyncClient.__init__
+        # The constructor's own api_key argument is a frame local too; repr=False can't hide it.
+        assert [
+            (f.name, name) for f in tb.stack for name, value in (f.locals or {}).items()
+            if "TBSECRET" in value and name != "api_key"
+        ] == []
 
     @pytest.mark.parametrize("index", range(4))
     def test_every_client_validates(self, index):

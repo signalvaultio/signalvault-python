@@ -9,6 +9,11 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Security
+
+- A `base_url` with credentials (`user:password@`, `user@`, `:password@`) raises `ValueError` when the client is created. httpx sent them as Basic auth in place of the API key, so every check failed with 401. Errors about `base_url` never quote the URL, which may hold credentials or a token; for example "base_url must be an https:// URL, got '...'" is now "base_url must be an https:// URL.", and a URL urllib can't parse raises "base_url is not a valid URL." instead of urllib's own error.
+- `SignalVaultConfig` leaves `api_key` out of its `repr()`, so the key is not shown by `repr(client._config)` or `vars(client)`, or by a traceback, debugger or error tracker that shows a `config` local. The client constructors' own `api_key` argument is still a frame local while they run.
+
 ### Changed
 
 - A refusal from SignalVault never reaches the provider, in either `fail_mode`. A pre-flight answer that says `content_policy_violation` (as `error`, `error.code` or `error.type`, with any status), or a `decision` of `"block"` in an answer that is not a 2xx, raises `SignalVaultBlockedError`, with the violations and the dashboard URL from the body when present. **Note:** this raises with `fail_mode="open"` too, and with `"closed"` it is `SignalVaultBlockedError` instead of `SignalVaultUnavailableError`. `content_policy_violation` is the SignalVault proxy's block answer; the events API does not send it, and the SDK reads it wherever it appears.

@@ -110,7 +110,8 @@ def _emit_warning(message: str, category: type = UserWarning) -> None:
 
 @dataclass
 class SignalVaultConfig:
-    api_key: str
+    # Left out of repr(), and so out of tracebacks and debuggers that show locals.
+    api_key: str = field(repr=False)
     base_url: str = DEFAULT_BASE_URL
     environment: str = "production"
     debug: bool = False
@@ -241,13 +242,23 @@ def normalize_base_url(raw: str) -> str:
     """Strips trailing slashes and refuses plaintext HTTP except to localhost.
 
     The API key and full prompts travel in every request, so an ``http://``
-    URL would expose both before the server could redirect to HTTPS.
+    URL would expose both before the server could redirect to HTTPS. A URL
+    with credentials is refused too: httpx would send them as Basic auth in
+    place of the API key. Errors never quote the URL, which may hold
+    credentials or a token.
     """
-    parsed = urlparse(raw)
+    try:
+        parsed = urlparse(raw)
+    except ValueError:
+        raise ValueError("[SignalVault] base_url is not a valid URL.") from None
+    if "@" in parsed.netloc:
+        raise ValueError(
+            "[SignalVault] base_url must not contain credentials (user:password@). Pass the key as api_key."
+        )
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise ValueError(f"[SignalVault] base_url must be an https:// URL, got {raw!r}")
+        raise ValueError("[SignalVault] base_url must be an https:// URL.")
     if parsed.query or parsed.fragment:
-        raise ValueError(f"[SignalVault] base_url must not contain a query or fragment, got {raw!r}")
+        raise ValueError("[SignalVault] base_url must not contain a query or fragment.")
     if parsed.scheme == "http" and parsed.hostname not in _LOCAL_HOSTS:
         raise ValueError(
             "[SignalVault] base_url must use https:// (plain http:// is only allowed for "
