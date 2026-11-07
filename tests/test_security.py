@@ -734,8 +734,11 @@ class TestMalformedDecisions:
             "decision": "block", "violations": [{"type": 7}, "junk", {"type": "pii"}],
         }}]})
         client = sync_client(server)
-        with pytest.raises(SignalVaultBlockedError, match=r"\(7, pii\)"):
+        with pytest.raises(SignalVaultBlockedError) as exc:
             client.chat.completions.create(model="m", messages=MESSAGES)
+        # Only a code-like type is named; the violation itself is kept as sent.
+        assert str(exc.value) == "[SignalVault] Request blocked by guardrails (pii)."
+        assert [v.type for v in exc.value.violations] == [7, "pii"]
 
 
 class TestWarningsRepeat:

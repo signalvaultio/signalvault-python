@@ -226,8 +226,7 @@ class SignalVaultBlockedError(RuntimeError):
     def __init__(
         self, request_id: str, violations: List[Violation], dashboard_url: Optional[str] = None,
     ) -> None:
-        types = ", ".join(dict.fromkeys(str(v.type) for v in violations if v.type)) or "policy"
-        super().__init__(f"[SignalVault] Request blocked by guardrails ({types}).")
+        super().__init__(f"[SignalVault] Request blocked by guardrails ({_violation_types(violations)}).")
         self.request_id = request_id
         self.violations = violations
         self.dashboard_url = dashboard_url
@@ -342,6 +341,18 @@ def _event_ref(event: dict) -> str:
     if "event_id" in event:
         return f"event_id={event['event_id']}"
     return f"request_id={event.get('request_id')} (fallback ai.request, which has no event_id)"
+
+
+def _violation_types(violations: List[Violation]) -> str:
+    """The violations' types for a message: each code-like one once, in order, else "policy".
+
+    Types are SignalVault's codes (``contains_pii``, ``keyword_blocklist``...);
+    any other text from the answer is left out. The violations keep it.
+    """
+    types = dict.fromkeys(
+        v.type for v in violations if isinstance(v.type, str) and _REASON_CODE.fullmatch(v.type)
+    )
+    return ", ".join(types) or "policy"
 
 
 def _merge_metadata(config_meta: Dict[str, Any], call_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -658,16 +669,19 @@ def _unchecked_reason(reason: Any) -> Optional[Tuple[str, str]]:
 
 
 def _describe_failure(status: int, body: Any) -> Tuple[str, str]:
-    """Maps a non-2xx pre-flight answer (status, parsed body) to (warning key, human reason)."""
+    """Maps a non-2xx pre-flight answer (status, parsed body) to (warning key, human reason).
+
+    No text from the body is used but a code (``_status_label``, ``_unchecked_reason``).
+    """
     error = body.get("error") if isinstance(body, dict) else None
     error_type = error.get("type") if isinstance(error, dict) else error
 
     if status == 401:
         return "401", "SignalVault rejected the API key (401: invalid or revoked)"
     if status == 402:
-        return "402", f"SignalVault account is not active (402: {error_type or 'payment required'})"
+        return "402", f"SignalVault account is not active ({_status_label(402, body)})"
     if status == 403:
-        return "403", f"SignalVault denied access (403: {error_type or 'forbidden'})"
+        return "403", f"SignalVault denied access ({_status_label(403, body)})"
     if status == 429:
         if isinstance(body, dict) and body.get("recorded") is True:
             # Stored without a decision, so the audit events that follow are
@@ -881,7 +895,10 @@ class _ClientCommon:
         if decision.decision == "block":
             raise SignalVaultBlockedError(request_id, decision.violations, decision.dashboard_url)
         if decision.decision == "warn" and self._config.debug:
-            _emit_warning(f"[SignalVault] Warnings: {decision.violations}", SignalVaultViolationWarning)
+            _emit_warning(
+                f"[SignalVault] Warnings from guardrails ({_violation_types(decision.violations)}).",
+                SignalVaultViolationWarning,
+            )
 
     def _response_body(
         self, request_id: str, model: str, output: str,
