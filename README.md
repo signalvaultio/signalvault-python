@@ -272,7 +272,7 @@ client = SignalVaultClient(
 )
 ```
 
-`base_url` defaults to `https://api.signalvault.io`. Plain `http://` is refused except for `localhost`, as is a URL with a query string or fragment.
+`base_url` defaults to `https://api.signalvault.io`. Plain `http://` is refused except for `localhost`, as is a URL with credentials (`user:password@`: pass the key as `api_key`), a query string or a fragment. These errors never quote the URL.
 
 ### Background delivery
 
